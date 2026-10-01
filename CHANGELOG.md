@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.0.10-beta - 2026-10-01
+
+- Report the bundled app version, payload schema 1, and SSE protocol 2 on authenticated desktop polling, live-stream, and exact-event receipt requests.
+- Display image-backed weather alerts in the same full-size layout as colored announcements, without duplicate raw text. Keep readable text as the loading/failure fallback and in Details.
+- Preserve weather severity, absolute expiry, explicit test markers, and local read status. Automatic app receipts remain separate from human read confirmations and Dismiss.
+
 ## 1.0.9-beta - 2026-09-21
 
 Changes since 1.0.8-beta:

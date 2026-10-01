@@ -2,7 +2,7 @@
 
 Windows desktop notifications for the Southland Servers FreePBX module.
 
-**[Download 1.0.9-beta](https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_app/releases/download/v1.0.9-beta/SLS_Mass_Notify_Installer.exe)** | [Changelog](CHANGELOG.md)
+**[Download 1.0.10-beta](https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_app/releases/download/v1.0.10-beta/SLS_Mass_Notify_Installer.exe)** | [Changelog](CHANGELOG.md)
 
 ## Install
 
@@ -18,11 +18,13 @@ Up to three PBX connections are supported. Use desktop credentials, not PBX admi
 - Announcements arrive live. Messages missed while asleep, shut down, or disconnected are skipped.
 - If live streaming stalls, the app checks for new announcements every five seconds. It remembers that fallback for 24 hours.
 - Queued and visible announcements expire ten minutes after publication, or earlier if the sender specifies an expiry. Weather alerts use their own expiry.
-- Colored announcements display the sender's design. **Details** shows the text, which also appears if the image cannot load.
+- Weather alerts and colored announcements display the sender's design in one full-size view, without a second text box. **Details** shows the text, which also appears while the image loads or if it cannot load. Weather severity, expiry, and explicit test markers still apply.
 - Routine notifications have one **Dismiss** button. Persistent alerts require **I have read this alert**. These actions are local.
 - The tray menu provides Settings, History, Health, and Exit. Settings includes sound controls and diagnostic export.
 
-Receipt acknowledgements are automatic and confirm receipt by the app, not that someone read the message. Server v0.1.4-beta may still show "Awaiting optional client acknowledgement" after receipt; correcting that status requires a server update.
+Receipt acknowledgements are automatic and confirm receipt by the app. The app retries failed acknowledgements using the same event ID. Read actions are recorded locally; reporting a person's read confirmation requires a separate authorized backend contract. Dismiss does not report that a person read the notification or change an incident's state. Some server versions may still show "Awaiting optional client acknowledgement" after receipt; correcting that status requires a server update.
+
+Authenticated polling, live-stream, and receipt requests send `X-SLS-Client-Version` using the version bundled with the app, `X-SLS-Payload-Schema: 1`, and `X-SLS-SSE-Protocol: 2`. The PBX can record these against the authenticated desktop identity. Basic authentication and endpoint paths are unchanged; no additional heartbeat endpoint or OS/device reports are used.
 
 ## Settings and updates
 

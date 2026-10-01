@@ -14,6 +14,11 @@ from sls_windowing import apply_window_icon
 
 
 def check_presentation(configure_style):
+    for kind in ("announcement", "alert"):
+        _check_visual_notification(configure_style, kind)
+
+
+def _check_visual_notification(configure_style, kind):
     """Use real asynchronous image loading and the app theme, without user data."""
     root = tk.Tk()
     root.withdraw()
@@ -33,8 +38,9 @@ def check_presentation(configure_style):
         presenter = SimpleNamespace(root=root, image_loader=image_loader,
                                     _image_slots=threading.BoundedSemaphore(2),
                                     _respond=lambda *_: None, show_history=lambda: None)
-        alert = dict(kind="announcement", title="Local presentation check", body="Fixture instructions",
-                     image_url="https://fixture.invalid/announcement.png", severity="notice")
+        alert = dict(kind=kind, title="Local presentation check", body="Fixture instructions",
+                     image_url="https://fixture.invalid/announcement.png",
+                     severity="Severe" if kind == "alert" else "notice")
         view = _AlertView(presenter, PendingAlert("fixture", alert, 0, presentation_policy(alert)), 0)
         view.window.attributes("-alpha", 0.0)
         root.update()
@@ -58,7 +64,8 @@ def check_presentation(configure_style):
         assert view.image_canvas.winfo_ismapped(), "Delayed image canvas is hidden"
         assert view.image_canvas.find_withtag("announcement"), "Image canvas is empty"
         assert not view.instructions.winfo_ismapped(), "Duplicate text remains visible"
-        assert view.ack.winfo_ismapped() and view.ack.cget("text") == "Dismiss"
+        assert view.ack.winfo_ismapped()
+        assert view.ack.cget("text") == ("I have read this alert" if kind == "alert" else "Dismiss")
         assert view.ack.winfo_rooty() + view.ack.winfo_height() <= view.window.winfo_rooty() + view.window.winfo_height()
         for window in (root, view.window):
             assert Path(getattr(window, "_sls_icon_path", "")).name == "favicon.ico", "SLS icon is not set on the window"

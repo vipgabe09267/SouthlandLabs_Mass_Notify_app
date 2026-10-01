@@ -1268,7 +1268,8 @@ def send_receipt_ack(endpoint_cfg: dict, event_id: str) -> None:
     url = normalize_pbx_address(endpoint_cfg.get("endpoint", "")) + PBX_ACK_PATH
     request = urllib.request.Request(url, data=json.dumps({"event_id": event_id}).encode("utf-8"),
         headers={"Content-Type": "application/json", "Accept": "application/json",
-                 "User-Agent": f"{APP_SHORT_NAME}/{APP_VERSION}", **endpoint_auth_headers(endpoint_cfg)}, method="POST")
+                 "User-Agent": f"{APP_SHORT_NAME}/{APP_VERSION}", **endpoint_auth_headers(endpoint_cfg),
+                 **desktop_client_headers()}, method="POST")
     try:
         with open_http_request(request, timeout=10, same_origin=True) as response:
             with SocketDeadline(response_socket(response), 10):
@@ -1280,6 +1281,15 @@ def send_receipt_ack(endpoint_cfg: dict, event_id: str) -> None:
     data = json.loads(body.decode("utf-8"))
     if not isinstance(data, dict) or data.get("ok") is not True or data.get("event_id") != event_id:
         raise StreamProtocolError("PBX did not confirm the notification receipt")
+
+
+def desktop_client_headers() -> dict[str, str]:
+    """Report the version bundled with this app and its desktop wire contracts."""
+    return {
+        "X-SLS-Client-Version": APP_VERSION,
+        "X-SLS-Payload-Schema": "1",
+        "X-SLS-SSE-Protocol": "2",
+    }
 
 
 def alert_expiry(alert: AlertData) -> float | None:
@@ -1303,6 +1313,8 @@ def fetch_endpoint(
         "User-Agent": f"{APP_SHORT_NAME}/{APP_VERSION}",
     }
     headers.update(auth_headers or {})
+    if any(key.lower() == "authorization" and value for key, value in headers.items()):
+        headers.update(desktop_client_headers())
     request = urllib.request.Request(endpoint, headers=headers, method="GET")
     opener = build_http_opener(same_origin=True)
     try:
@@ -1430,6 +1442,7 @@ def open_sse_response(
         "Cache-Control": "no-cache",
         "User-Agent": f"{APP_SHORT_NAME}/{APP_VERSION}",
         **endpoint_auth_headers(endpoint_cfg),
+        **desktop_client_headers(),
     }
     # No Last-Event-ID: every connection starts at the current journal tail.
     # Missed broadcasts must never be replayed after startup or reconnect.

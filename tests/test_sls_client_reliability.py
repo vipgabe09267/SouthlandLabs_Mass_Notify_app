@@ -481,6 +481,9 @@ class StreamAndReceiptIntegrationTests(IsolatedClientTest):
         self.assertEqual(req.full_url, "https://pbx.example.test/api/sipnotify/desktop/ack")
         self.assertEqual(json.loads(req.data), {"event_id": "event-1"})
         self.assertTrue(req.get_header("Authorization").startswith("Basic "))
+        self.assertEqual(client.VERSION, req.get_header("X-sls-client-version"))
+        self.assertEqual("1", req.get_header("X-sls-payload-schema"))
+        self.assertEqual("2", req.get_header("X-sls-sse-protocol"))
         self.assertEqual(request.call_args.kwargs, {"timeout": 10, "same_origin": True})
 
     def test_ack_requires_explicit_matching_server_confirmation(self):

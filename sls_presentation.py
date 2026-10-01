@@ -572,8 +572,7 @@ class _AlertView:
         try:
             self.window.title(text(field(item.alert, "title")) or "SLS Mass Notify")
             self.window.resizable(True, True)
-            self.visual_announcement = (text(field(item.alert, "kind")).lower() == "announcement"
-                                        and bool(field(item.alert, "image_url")))
+            self.visual_notification = bool(field(item.alert, "image_url"))
             self._image_source: Any = None
             self._rendered_size: tuple[int, int] | None = None
             frame = ttk.Frame(self.window, padding=16)
@@ -601,15 +600,15 @@ class _AlertView:
             header = ttk.Frame(frame)
             header.pack(fill="x")
             marker_label = ttk.Label(header, text=test_marker(item.alert), font=("Segoe UI", 12, "bold"), wraplength=690)
-            # The designed announcement already includes its heading and message.
+            # Server-rendered weather and announcement designs include the message.
             # Keep explicit drill identification visible; other metadata is in Details.
-            if not self.visual_announcement or explicit_test_mode(item.alert) is True:
+            if not self.visual_notification or explicit_test_mode(item.alert) is True:
                 marker_label.pack(fill="x", pady=(0, 8))
             title = ttk.Label(header, text=text(field(item.alert, "title")) or "Notification",
                               font=("Segoe UI", 19, "bold"), wraplength=690)
             metadata = [text(field(item.alert, key)) for key in ("priority_label", "severity", "area") if field(item.alert, key)]
             metadata_label = ttk.Label(header, text=" | ".join(dict.fromkeys(metadata)), wraplength=690)
-            if not self.visual_announcement:
+            if not self.visual_notification:
                 title.pack(fill="x", pady=(0, 8))
                 metadata_label.pack(fill="x", pady=(0, 8))
             content = ttk.Frame(frame)
@@ -629,14 +628,14 @@ class _AlertView:
             if (len(background) != 7 or not background.startswith("#")
                     or any(char not in "0123456789abcdefABCDEF" for char in background[1:])):
                 background = "#1f2937"
-            if self.visual_announcement:
+            if self.visual_notification:
                 red, green, blue = (int(background[i:i+2], 16) for i in (1, 3, 5))
                 foreground = "#ffffff" if .2126*red + .7152*green + .0722*blue < 140 else "#111111"
                 self.instructions.configure(background=background, foreground=foreground)
             self.image_canvas = tk.Canvas(content, width=1, height=160, highlightthickness=0,
                                           background=background)
             self.image_canvas.bind("<Configure>", lambda _event: self._render_image())
-            if not self.visual_announcement:
+            if not self.visual_notification:
                 content.bind("<Configure>", lambda event: self.image_canvas.configure(
                     height=min(160, max(1, event.height // 3))))
             self.window.protocol("WM_DELETE_WINDOW", self.close_requested)
@@ -657,11 +656,10 @@ class _AlertView:
                 self.instructions.focus_set()
             if presenter.image_loader and field(item.alert, "image_url"):
                 if presenter._image_slots.acquire(blocking=False):
-                    self.status_var.set("Loading announcement design..." if self.visual_announcement else "Loading image...")
+                    self.status_var.set("Loading notification design...")
                     threading.Thread(target=self._load_image, name="alert-image", daemon=True).start()
                 else:
-                    self.status_var.set("Image unavailable. Showing the written announcement." if self.visual_announcement
-                                        else "Image unavailable. Written instructions are shown above.")
+                    self.status_var.set("Image unavailable. Showing the notification text.")
         except Exception:
             self.window.destroy()
             raise
@@ -721,7 +719,7 @@ class _AlertView:
                                            anchor="center", tags="announcement")
             self._rendered_size = size
         if self.image_canvas.winfo_ismapped():
-            if self.visual_announcement:
+            if self.visual_notification:
                 self.instructions.grid_remove()
             self.status_var.set("")
 
@@ -735,14 +733,13 @@ class _AlertView:
                 self._render_image()
             return
         if result is None:
-            self.status_var.set("Image unavailable. Showing the written announcement." if self.visual_announcement
-                                else "Image unavailable. Written instructions remain available above.")
+            self.status_var.set("Image unavailable. Showing the notification text.")
             return
         try:
             self._image_source = result
-            if not self.visual_announcement:
+            if not self.visual_notification:
                 self.image_canvas.configure(height=min(160, max(1, self.image_canvas.master.winfo_height() // 3)))
-            self.image_canvas.grid(row=0 if self.visual_announcement else 1, column=0, sticky="nsew")
+            self.image_canvas.grid(row=0 if self.visual_notification else 1, column=0, sticky="nsew")
             self.window.update_idletasks()
             self._render_image()
         except Exception:

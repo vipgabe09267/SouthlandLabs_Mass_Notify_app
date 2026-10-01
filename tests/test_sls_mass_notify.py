@@ -251,6 +251,10 @@ class SseProtocolTests(unittest.TestCase):
         self.assertEqual("text/event-stream", opener.request.get_header("Accept"))
         self.assertIsNone(opener.request.get_header("Last-event-id"))
         self.assertTrue(opener.request.get_header("Authorization").startswith("Basic "))
+        self.assertEqual(app.VERSION, opener.request.get_header("X-sls-client-version"))
+        self.assertEqual("1", opener.request.get_header("X-sls-payload-schema"))
+        self.assertEqual("2", opener.request.get_header("X-sls-sse-protocol"))
+        self.assertEqual("https://pbx.example.com/api/sipnotify/desktop/stream", opener.request.full_url)
 
     def test_stream_refuses_insecure_basic_credentials(self):
         with self.assertRaisesRegex(ValueError, "HTTPS"):
@@ -320,6 +324,35 @@ class SseProtocolTests(unittest.TestCase):
 
 
 class NetworkSecurityTests(unittest.TestCase):
+    def test_authenticated_poll_reports_bundled_version_without_extra_device_fields(self):
+        class FakeResponse(io.BytesIO):
+            headers = {"Content-Type": "application/json", "Date": "Thu, 01 Oct 2026 22:00:00 GMT"}
+
+        opener = mock.Mock()
+        opener.open.return_value = FakeResponse(b'{"ok":true,"events":[]}')
+        profile = {"endpoint": "https://pbx.example.com", "username": "frontdesk", "password": "secret"}
+        with mock.patch.object(app, "build_http_opener", return_value=opener):
+            app.fetch_endpoint(app.pbx_recent_url(profile), app.endpoint_auth_headers(profile), include_server_time=True)
+        request = opener.open.call_args.args[0]
+        self.assertEqual("https://pbx.example.com/api/sipnotify/desktop?limit=100", request.full_url)
+        self.assertEqual("Basic ZnJvbnRkZXNrOnNlY3JldA==", request.get_header("Authorization"))
+        self.assertEqual(app.VERSION, request.get_header("X-sls-client-version"))
+        self.assertEqual("1", request.get_header("X-sls-payload-schema"))
+        self.assertEqual("2", request.get_header("X-sls-sse-protocol"))
+        self.assertEqual({"X-sls-client-version", "X-sls-payload-schema", "X-sls-sse-protocol"},
+                         {name for name, _ in request.header_items() if name.lower().startswith("x-sls-")})
+
+    def test_unauthenticated_poll_does_not_report_a_client_identity(self):
+        class FakeResponse(io.BytesIO):
+            headers = {"Content-Type": "application/json"}
+
+        opener = mock.Mock()
+        opener.open.return_value = FakeResponse(b'{"ok":true,"events":[]}')
+        with mock.patch.object(app, "build_http_opener", return_value=opener):
+            app.fetch_endpoint("https://pbx.example.com/api/sipnotify/desktop")
+        request = opener.open.call_args.args[0]
+        self.assertFalse(any(name.lower().startswith("x-sls-") for name, _ in request.header_items()))
+
     def test_same_origin_redirect_handler_blocks_credential_forwarding(self):
         handler = app.SameOriginRedirectHandler()
         request = app.urllib.request.Request("https://pbx.example.com/stream")

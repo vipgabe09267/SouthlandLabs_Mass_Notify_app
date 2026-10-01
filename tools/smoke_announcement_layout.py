@@ -54,7 +54,9 @@ def main():
                 for kind, explicit_test, failed in (("announcement", False, False),
                                                    ("announcement", True, False),
                                                    ("announcement", False, True),
-                                                   ("alert", False, False)):
+                                                   ("alert", False, False),
+                                                   ("alert", True, False),
+                                                   ("alert", False, True)):
                     alert = dict(kind=kind, title="Color announcement", body="Fixture instructions",
                                  image_url="https://fixture.invalid/image.png", background_color="#1f2937",
                                  severity="critical" if kind == "alert" else "notice",
@@ -72,7 +74,7 @@ def main():
                     root.after(80, root.quit)
                     root.mainloop()
                     check_control(view.window, view.ack)
-                    assert view.instructions.winfo_ismapped() == (failed or kind == "alert"), (
+                    assert view.instructions.winfo_ismapped() == failed, (
                         scaling, kind, explicit_test, failed, view.status_var.get(), view.window.winfo_geometry())
                     assert view.image_canvas.winfo_ismapped() == (not failed)
                     if not failed:
@@ -97,14 +99,14 @@ def main():
                     fit_window(view.window, (560, 380), area=area)
                     root.update()
                     check_control(view.window, view.ack)
-                    if not failed and kind == "announcement":
+                    if not failed:
                         check_control(view.window, view.image_canvas)
                     view.close()
         finally:
             for view in views:
                 view.close()
             root.destroy()
-    print("PASS: color image only, readable failure fallback, visible Dismiss, persistent-alert read control, "
+    print("PASS: weather and announcement image only, readable failure fallback, visible Dismiss, persistent-alert read control, "
           "drill marker and image resizing at normal/high scaling in a restricted work area.")
 
 
