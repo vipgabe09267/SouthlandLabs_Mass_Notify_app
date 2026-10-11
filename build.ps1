@@ -43,7 +43,7 @@ Invoke-NativeChecked -Executable $buildPython -Arguments @('tools/smoke_window_l
 Invoke-NativeChecked -Executable $buildPython -Arguments @('tools/smoke_notification_delivery.py')
 Invoke-NativeChecked -Executable $buildPython -Arguments @('tools/smoke_announcement_layout.py')
 Invoke-NativeChecked -Executable $buildPython -Arguments @('tools/write_version_info.py')
-Invoke-NativeChecked -Executable $buildPython -Arguments @('-m', 'PyInstaller', '--noconfirm', '--clean', '--onedir', '--windowed', '--noupx', '--name', 'SLS_Mass_Notify', '--icon', 'favicon.ico', '--version-file', 'version_info_app.txt', '--add-data', 'icon.png;.', '--add-data', 'favicon.ico;.', '--add-data', 'audio;audio', 'sls_mass_notify.py')
+Invoke-NativeChecked -Executable $buildPython -Arguments @('-m', 'PyInstaller', '--noconfirm', '--clean', '--onedir', '--windowed', '--noupx', '--name', 'SLS_Mass_Notify', '--icon', 'assets/favicon.ico', '--version-file', 'build/version_info_app.txt', '--add-data', 'assets/icon.png;.', '--add-data', 'assets/favicon.ico;.', '--add-data', 'assets/audio;audio', 'src/sls_mass_notify.py')
 $AppExe = Join-Path $ProjectRoot 'dist\SLS_Mass_Notify\SLS_Mass_Notify.exe'
 if (-not (Test-Path -LiteralPath $AppExe -PathType Leaf)) { throw 'Application output was not created.' }
 if ($Release) {

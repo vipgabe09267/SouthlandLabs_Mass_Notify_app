@@ -16,7 +16,7 @@ import tkinter as tk
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "src"))
 import sls_installer as installer
 import sls_install_safety as safety
 import sls_install_windows as windows

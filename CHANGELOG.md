@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.0.11-beta - 2026-10-11
+
+- Give Windows 90 seconds after startup or wake to restore networking without connection-error notices. Reset transient fault timers after sleep and keep automatic reconnection and receipt retries.
+- Remove queued and visible notices when their fault clears. Sustained outages still produce a notice; credential, TLS, and local storage faults are retained for review.
+- Place notices at the bottom right above the primary taskbar. Replace fixed canvas text with wrapped content and visible Settings/Dismiss controls, and remove error beeps.
+- Preserve live-only delivery and discard old sockets and queued announcements after wake.
+- Organize application source into `src/` and original artwork/sounds into `assets/`. Generate Windows version resources in the build folder instead of tracking duplicate metadata.
+- Rewrite the README with installation steps, behavior and compatibility tables, troubleshooting, and build instructions. Keep release downloads limited to the installer EXE.
+
 ## 1.0.10-beta - 2026-10-01
 
 - Report the bundled app version, payload schema 1, and SSE protocol 2 on authenticated desktop polling, live-stream, and exact-event receipt requests.
