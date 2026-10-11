@@ -8,7 +8,7 @@ import tkinter as tk
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "src"))
 import sls_mass_notify as client
 import sls_installer as installer
 from sls_windowing import fit_window, monitor_work_area
@@ -73,9 +73,23 @@ def main():
                 check_bounds(settings.window, area)
                 check_control(settings.window, settings.test_button)
                 check_control(settings.window, settings.status_label)
+                with mock.patch.object(client, "Toplevel", side_effect=invisible):
+                    toast = client.FaultToast(app, "The PBX connection is unavailable. Saved receipts will retry automatically when the network returns.")
+                toast.window.update()
+                work = monitor_work_area(root, primary=True)
+                user = ctypes.windll.user32
+                rect = wintypes.RECT()
+                handle = user.GetAncestor(toast.window.winfo_id(), 2)
+                assert user.GetWindowRect(handle, ctypes.byref(rect))
+                assert abs(rect.right - (work[2]-12)) <= 1, (rect.right, work)
+                assert abs(rect.bottom - (work[3]-12)) <= 1, (rect.bottom, work)
+                assert rect.left >= work[0] and rect.top >= work[1]
+                for widget in toast.window.winfo_children()[1].winfo_children()[-1].winfo_children():
+                    check_control(toast.window, widget)
+                toast.hide()
             finally:
                 root.destroy()
-    print("PASS: native Settings and setup frames fit the work area at normal/high scaling; actions remain visible and setup scrolls.")
+    print("PASS: native Settings/setup fit at normal/high scaling; fault notices sit bottom-right above the taskbar with visible actions.")
 
 
 if __name__ == "__main__":

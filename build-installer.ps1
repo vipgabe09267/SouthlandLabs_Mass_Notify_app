@@ -15,7 +15,7 @@ $buildArgs = @{ Clean=$Clean; Release=$Release; PythonExecutable=$PythonExecutab
 & (Join-Path $ProjectRoot 'build.ps1') @buildArgs
 $buildPython = Join-Path $ProjectRoot '.venv-build\Scripts\python.exe'
 $appDirectory = Join-Path $ProjectRoot 'dist\SLS_Mass_Notify'
-Invoke-NativeChecked -Executable $buildPython -Arguments @('-m', 'PyInstaller', '--noconfirm', '--clean', '--onedir', '--windowed', '--noupx', '--distpath', 'build/installer-payload', '--name', 'SLS_Mass_Notify_Installer', '--icon', 'favicon.ico', '--version-file', 'version_info_installer.txt', '--add-data', "$appDirectory;SLS_Mass_Notify", '--add-data', 'favicon.ico;.', '--add-data', 'audio;audio', 'sls_installer.py')
+Invoke-NativeChecked -Executable $buildPython -Arguments @('-m', 'PyInstaller', '--noconfirm', '--clean', '--onedir', '--windowed', '--noupx', '--distpath', 'build/installer-payload', '--name', 'SLS_Mass_Notify_Installer', '--icon', 'assets/favicon.ico', '--version-file', 'build/version_info_installer.txt', '--add-data', "$appDirectory;SLS_Mass_Notify", '--add-data', 'assets/favicon.ico;.', '--add-data', 'assets/audio;audio', 'src/sls_installer.py')
 $installerDirectory = Join-Path $ProjectRoot 'build\installer-payload\SLS_Mass_Notify_Installer'
 $installerExe = Join-Path $installerDirectory 'SLS_Mass_Notify_Installer.exe'
 if (-not (Test-Path -LiteralPath $installerExe -PathType Leaf)) { throw 'Installer output was not created.' }
@@ -55,5 +55,5 @@ foreach ($oldName in @('README.txt', 'SLS_Mass_Notify_Installer.zip', 'SLS_Mass_
     $oldPath = Join-Path (Join-Path $ProjectRoot 'dist') $oldName
     if (Test-Path -LiteralPath $oldPath -PathType Leaf) { Remove-Item -LiteralPath $oldPath -Force }
 }
-if (-not $Release) { Write-Warning 'Development package is unsigned. Do not publish it or use it for production deployment.' }
+if (-not $Release) { Write-Warning 'Unsigned beta package. Production deployment requires signing and release validation.' }
 Write-Host "Built installer package: $archive"

@@ -10,7 +10,7 @@ from tkinter import ttk
 
 def apply_window_icon(window):
     """Set both this window's icon and the default for future Tk windows."""
-    icon = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent)) / "favicon.ico"
+    icon = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent.parent / "assets")) / "favicon.ico"
     if not icon.is_file():
         return
     try:
@@ -21,7 +21,7 @@ def apply_window_icon(window):
         pass
 
 
-def monitor_work_area(window):
+def monitor_work_area(window, *, primary=False):
     if os.name == "nt":
         class MonitorInfo(ctypes.Structure):
             _fields_ = [("size", wintypes.DWORD), ("monitor", wintypes.RECT),
@@ -32,26 +32,32 @@ def monitor_work_area(window):
         user.GetMonitorInfoW.argtypes = [wintypes.HANDLE, ctypes.POINTER(MonitorInfo)]
         point, info = wintypes.POINT(), MonitorInfo()
         info.size = ctypes.sizeof(info)
-        if user.GetCursorPos(ctypes.byref(point)) and user.GetMonitorInfoW(user.MonitorFromPoint(point, 2), ctypes.byref(info)):
+        if (primary or user.GetCursorPos(ctypes.byref(point))) and user.GetMonitorInfoW(user.MonitorFromPoint(point, 2), ctypes.byref(info)):
             return info.work.left, info.work.top, info.work.right, info.work.bottom
     return 0, 0, window.winfo_screenwidth(), window.winfo_screenheight()
 
 
-def window_rectangle(area, preferred, decoration=(16, 48), margin=12):
+def window_rectangle(area, preferred, decoration=(16, 48), margin=12, *, position="center"):
     left, top, right, bottom = area
     available_w, available_h = max(1, right-left-2*margin), max(1, bottom-top-2*margin)
     width = max(1, min(preferred[0], available_w-decoration[0]))
     height = max(1, min(preferred[1], available_h-decoration[1]))
-    x = left + max(0, (right-left-width-decoration[0]) // 2)
-    y = top + max(0, (bottom-top-height-decoration[1]) // 2)
+    if position == "bottom_right":
+        x = max(left, right-margin-width-decoration[0])
+        y = max(top, bottom-margin-height-decoration[1])
+    elif position == "center":
+        x = left + max(0, (right-left-width-decoration[0]) // 2)
+        y = top + max(0, (bottom-top-height-decoration[1]) // 2)
+    else:
+        raise ValueError("Unsupported window position")
     return width, height, x, y
 
 
-def fit_window(window, preferred=None, *, minimum=(480, 320), area=None):
+def fit_window(window, preferred=None, *, minimum=(480, 320), area=None, position="center"):
     """Fit the whole native frame, including its title bar, inside the work area."""
     apply_window_icon(window)
     window.update_idletasks()
-    area = area or monitor_work_area(window)
+    area = area or monitor_work_area(window, primary=position == "bottom_right")
     preferred = preferred or (window.winfo_reqwidth(), window.winfo_reqheight())
     decoration = (16, 48)
     handle = None
@@ -65,7 +71,7 @@ def fit_window(window, preferred=None, *, minimum=(480, 320), area=None):
         outer, inner = wintypes.RECT(), wintypes.RECT()
         if handle and user.GetWindowRect(handle, ctypes.byref(outer)) and user.GetClientRect(handle, ctypes.byref(inner)):
             decoration = (max(0, outer.right-outer.left-inner.right), max(0, outer.bottom-outer.top-inner.bottom))
-    width, height, x, y = window_rectangle(area, preferred, decoration)
+    width, height, x, y = window_rectangle(area, preferred, decoration, position=position)
     window.minsize(min(width, minimum[0]), min(height, minimum[1]))
     window.geometry(f"{width}x{height}")
     window.update_idletasks()

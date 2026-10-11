@@ -12,7 +12,7 @@ import pefile
 from PyInstaller.archive.readers import CArchiveReader
 
 ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "src"))
 from sls_version import VERSION
 from build_setup_bootstrap import source_digest
 
@@ -59,13 +59,13 @@ def verify(directory, main):
         if VERSION not in versions:
             raise SystemExit(f"Executable version resource does not match {VERSION}: {executable}")
     archive = CArchiveReader(str(executable))
-    source = compile((ROOT / f"{main}.py").read_bytes(), str(ROOT / f"{main}.py"), "exec", optimize=0)
+    source = compile((ROOT / "src" / f"{main}.py").read_bytes(), str(ROOT / "src" / f"{main}.py"), "exec", optimize=0)
     if not code_equal(marshal.loads(archive.extract(main)), source):
         raise SystemExit(f"Packaged entry point differs from source: {main}")
     modules = archive.open_embedded_archive("PYZ.pyz")
     for name in modules.toc:
-        if name.startswith("sls_") and (ROOT / f"{name}.py").exists():
-            source = compile((ROOT / f"{name}.py").read_bytes(), str(ROOT / f"{name}.py"), "exec", optimize=0)
+        if name.startswith("sls_") and (ROOT / "src" / f"{name}.py").exists():
+            source = compile((ROOT / "src" / f"{name}.py").read_bytes(), str(ROOT / "src" / f"{name}.py"), "exec", optimize=0)
             if not code_equal(modules.extract(name), source):
                 raise SystemExit(f"Packaged module differs from current source: {name}")
     base_dll = Path(sys.base_prefix) / "python314.dll"

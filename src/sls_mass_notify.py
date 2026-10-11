@@ -79,6 +79,7 @@ SSE_MAX_EVENT_BYTES = 512 * 1024
 RECENT_EVENT_ID_LIMIT = 100
 RECONNECT_BACKOFF_SECONDS = (1, 2, 5, 10, 20, 30)
 FAULT_NOTIFY_SECONDS = 5 * 60
+NETWORK_RECOVERY_SECONDS = 90
 FAULT_TOAST_VISIBLE_MS = 18000
 IMAGE_FETCH_LIMIT_BYTES = 5 * 1024 * 1024
 UPDATE_CHECK_SECONDS = 15 * 60
@@ -143,7 +144,7 @@ LATEST_OBJECT_KEYS = {
 
 
 def resource_path(name: str) -> Path:
-    base = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+    base = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent.parent / "assets"))
     bundled = base / name
     if bundled.exists():
         return bundled
@@ -1630,57 +1631,32 @@ class FaultToast:
         except Exception:
             pass
 
-        canvas = tk.Canvas(
-            self.window,
-            width=self.WIDTH,
-            height=self.HEIGHT,
-            bg="#181818",
-            highlightthickness=0,
-            bd=0,
-        )
-        canvas.pack(fill="both", expand=True)
-        canvas.create_rectangle(0, 0, self.WIDTH, self.HEIGHT, fill="#181818", outline="#353535")
-        canvas.create_rectangle(0, 0, 8, self.HEIGHT, fill="#d18a00", outline="#d18a00")
-        canvas.create_text(
-            24,
-            22,
-            text="SLS Mass Notify Fault",
-            fill="#ffffff",
-            anchor="w",
-            font=("Segoe UI", 12, "bold"),
-        )
-        canvas.create_text(
-            24,
-            58,
-            text=message[:140] + ("…" if len(message) > 140 else ""),
-            fill="#f0f0f0",
-            anchor="nw",
-            width=360,
-            font=("Segoe UI", 10),
-        )
-        canvas.create_text(
-            24,
-            130,
-            text="Click to open settings. Right-click to dismiss.",
-            fill="#bdbdbd",
-            anchor="w",
-            font=("Segoe UI", 9),
-        )
-
-        self.window.bind("<Button-1>", self._open_settings)
+        self.window.withdraw()
+        tk.Frame(self.window, bg="#d18a00", width=5).pack(side="left", fill="y")
+        body = tk.Frame(self.window, bg="#181c21", padx=16, pady=12)
+        body.pack(fill="both", expand=True)
+        tk.Label(body, text="SLS Mass Notify", bg="#181c21", fg="#f3f4f6",
+                 font=("Segoe UI", 11, "bold"), anchor="w").pack(fill="x")
+        self.message_label = tk.Label(body, text=message[:220] + ("…" if len(message) > 220 else ""),
+                 bg="#181c21", fg="#dce2e9", font=("Segoe UI", 10), justify="left", anchor="w")
+        self.message_label.pack(fill="x", pady=(6, 10))
+        footer = tk.Frame(body, bg="#181c21")
+        footer.pack(fill="x")
+        for label, command in (("Settings", self._open_settings), ("Dismiss", self.hide)):
+            tk.Button(footer, text=label, command=command, bg="#2a3038", fg="#f3f4f6",
+                      activebackground="#343c46", activeforeground="#ffffff", relief="flat",
+                      padx=10, pady=4, font=("Segoe UI", 9)).pack(side="right", padx=(6, 0))
         self.window.bind("<Button-3>", lambda _event: self.hide())
-        canvas.bind("<Button-1>", self._open_settings)
-        canvas.bind("<Button-3>", lambda _event: self.hide())
         self._place()
-        if winsound is not None:
-            try:
-                winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
-            except RuntimeError:
-                pass
+        self.window.deiconify()
         self.window.after(FAULT_TOAST_VISIBLE_MS, self.hide)
 
     def _place(self) -> None:
-        fit_window(self.window, (self.WIDTH, self.HEIGHT), minimum=(320, 120))
+        width, _height = fit_window(self.window, (self.WIDTH, self.HEIGHT), minimum=(280, 120), position="bottom_right")
+        self.message_label.configure(wraplength=max(100, width-45))
+        self.window.update_idletasks()
+        fit_window(self.window, (width, max(self.HEIGHT, self.window.winfo_reqheight())),
+                   minimum=(280, 120), position="bottom_right")
 
     def _open_settings(self, _event=None) -> None:
         self.hide()
@@ -2316,12 +2292,12 @@ class EndpointTransportWorker:
                 return self.app.workers.get(self.index) is self
         return True
 
-    def _fault(self, message: str) -> None:
+    def _fault(self, message: str, *, recoverable: bool = False) -> None:
         if not self._is_current():
             return
         key = f"endpoint-{self.index}"
-        self.app.record_fault(key, message)
-        log(message)
+        if self.app.record_fault(key, message, recoverable=recoverable):
+            log(message)
 
     def run(self) -> None:
         if 0 < self.endpoint_cfg.get("live_polling_until", 0) - time.time() <= 86400:
@@ -2387,7 +2363,7 @@ class EndpointTransportWorker:
                     return
                 message = f"{name}: {exc}"
                 self._status("RATE_LIMITED", message)
-                self._fault(message)
+                self._fault(message, recoverable=True)
                 if self.stop_event.wait(exc.retry_after):
                     return
                 self._run_live_polling()
@@ -2401,8 +2377,8 @@ class EndpointTransportWorker:
                     return
                 if self.authenticated_this_attempt:
                     backoff_index = 0
-                message = f"{name}: live transport fault: {safe_string(exc)}"
-                self._fault(message)
+                message = f"{name}: connection interrupted; reconnecting automatically."
+                self._fault(message, recoverable=True)
                 if not bool(self.endpoint_cfg.get("reconnect_automatically", True)):
                     self._status("DISCONNECTED", message)
                     self.stop_event.wait()
@@ -2452,10 +2428,10 @@ class EndpointTransportWorker:
                 for payload in fresh:
                     self._accept_payload(payload, json.dumps(payload), delivery_source="live polling",
                                          auth_generation=generation)
-            except UnauthorizedError as exc:
+            except (UnauthorizedError, TlsRequiredError) as exc:
                 self._invalidate_auth(revoked=True)
                 self._fault(str(exc))
-                self._status("AUTH_FAILED", f"{name}: credentials require review")
+                self._status("AUTH_FAILED" if isinstance(exc, UnauthorizedError) else "TLS_REQUIRED", f"{name}: {exc}")
                 self.stop_event.wait()
                 return
             except Exception as exc:
@@ -2464,7 +2440,7 @@ class EndpointTransportWorker:
                 if not self._is_current():
                     return
                 self.app.inbox.expire_active(profile_namespace(self.endpoint_cfg), include_displayed=False)
-                self._fault(f"{name}: live polling interrupted: {exc}")
+                self._fault(f"{name}: live polling interrupted; reconnecting automatically.", recoverable=True)
                 self._status("RECONNECTING", f"{name}: live polling interrupted; missed messages will be skipped")
                 delay = exc.retry_after if isinstance(exc, RateLimitedError) else 15.0
             if self.stop_event.wait(delay):
@@ -2496,7 +2472,7 @@ class EndpointTransportWorker:
                         self.app.clear_fault(f"receipt-{self.index}")
                     except Exception as exc:
                         self.app.inbox.receipt_failed(receipt["receipt_id"], str(exc))
-                        self.app.record_fault(f"receipt-{self.index}", "PBX receipt synchronization failed; saved receipts will retry.")
+                        self.app.record_fault(f"receipt-{self.index}", "PBX receipt synchronization failed; saved receipts will retry.", recoverable=not isinstance(exc, UnauthorizedError))
                         raise
             except UnauthorizedError as exc:
                 self._invalidate_auth(revoked=True)
@@ -2509,8 +2485,8 @@ class EndpointTransportWorker:
                     return
                 if not self._generation_is_current(generation):
                     continue
-                self.app.record_fault(f"receipt-{self.index}", f"Receipt synchronization failed: {exc}")
-                log(f"PBX {self.index + 1} receipt synchronization failed: {exc}")
+                if self.app.record_fault(f"receipt-{self.index}", "PBX receipt synchronization failed; saved receipts will retry.", recoverable=True):
+                    log(f"PBX {self.index + 1} receipt synchronization failed: {exc}")
                 delay = exc.retry_after if isinstance(exc, RateLimitedError) else 15.0
             if self.stop_event.wait(delay):
                 return
@@ -2734,6 +2710,8 @@ class MassNotifyApp:
         self.inbox.expire_active()
         self.inbox.prune(retention_days=int(self.config.get("retention_days", 30)))
         self._last_delivery_tick = time.time()
+        self._network_recovery_until = time.monotonic() + NETWORK_RECOVERY_SECONDS
+        self.fault_toast = None
         self._scheduled_records: set[str] = set()
         self.stop_event = threading.Event()
         self.wakeup_event = threading.Event()
@@ -2876,17 +2854,27 @@ class MassNotifyApp:
                 workers = list(self.workers.values())
                 self.workers.clear()
             self._last_delivery_tick = now
+        self.begin_network_recovery()
         for worker in workers:
             worker.stop()
         self.wakeup_event.set()
 
+    def begin_network_recovery(self) -> None:
+        """Allow Windows to restore the NIC without aging transient faults in sleep."""
+        with self.faults_lock:
+            self._network_recovery_until = time.monotonic() + NETWORK_RECOVERY_SECONDS
+            for key in list(self.faults):
+                if self.faults[key].get("recoverable"):
+                    del self.faults[key]
+        self.ui_queue.put(("status", "Reconnecting after wake; waiting for the network."))
+
     def evaluate_faults(self) -> None:
         now = time.monotonic()
         with self.faults_lock:
-            for fault in self.faults.values():
+            for key, fault in self.faults.items():
                 if not fault.get("notified") and now - fault["started_at"] >= FAULT_NOTIFY_SECONDS:
                     fault["notified"] = True
-                    self.ui_queue.put(("fault", fault["message"]))
+                    self.ui_queue.put(("fault", (key, fault["token"])))
 
     def show_history(self) -> None:
         self.presenter.show_history(self.inbox.history())
@@ -3013,13 +3001,23 @@ class MassNotifyApp:
         except Exception as exc:
             self.record_fault("ipc", f"Local control unavailable: {exc}")
 
-    def record_fault(self, key: str, message: str) -> None:
+    def record_fault(self, key: str, message: str, *, recoverable: bool = False) -> bool:
         with self.faults_lock:
+            if recoverable and time.monotonic() < getattr(self, "_network_recovery_until", 0):
+                return False
             is_new = key not in self.faults
-            fault = self.faults.setdefault(key, {"started_at": time.monotonic(), "notified": False})
+            fault = self.faults.setdefault(key, {"started_at": time.monotonic(), "notified": False,
+                                               "token": secrets.token_hex(8)})
+            if fault.get("recoverable") and not recoverable:
+                # An authentication/configuration failure is a new fault, even if
+                # a connection interruption previously occupied the same key.
+                fault.update(started_at=time.monotonic(), notified=False, token=secrets.token_hex(8))
+                is_new = True
+            fault["recoverable"] = recoverable
             fault["message"] = message
         if is_new:
             self.ui_queue.put(("status", self.status_text))
+        return is_new
 
     def clear_fault(self, key: str | None = None) -> None:
         with self.faults_lock:
@@ -3208,6 +3206,14 @@ class MassNotifyApp:
             self.config = staged
 
     def process_ui_queue(self) -> None:
+        self.check_delivery_resume()
+        toast = getattr(self, "fault_toast", None)
+        if toast is not None:
+            with self.faults_lock:
+                fault = self.faults.get(toast.fault_key)
+                if fault is None or fault["token"] != toast.fault_token:
+                    toast.hide()
+                    self.fault_toast = None
         deadline = time.monotonic() + 0.015
         for _ in range(32):
             if time.monotonic() > deadline:
@@ -3218,7 +3224,16 @@ class MassNotifyApp:
                 break
             try:
                 if kind == "fault":
-                    FaultToast(self, safe_string(value))
+                    key, token = value
+                    with self.faults_lock:
+                        fault = self.faults.get(key)
+                        if fault is None or fault["token"] != token:
+                            continue  # Resolved/replaced while queued, including wake.
+                        message = fault["message"]
+                    if getattr(self, "fault_toast", None) is not None:
+                        self.fault_toast.hide()
+                    self.fault_toast = FaultToast(self, message)
+                    self.fault_toast.fault_key, self.fault_toast.fault_token = key, token
                 elif kind == "settings":
                     self.show_settings()
                 elif kind == "history":
