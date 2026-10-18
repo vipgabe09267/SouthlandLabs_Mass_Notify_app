@@ -1,6 +1,7 @@
 param(
     [switch]$Clean,
     [switch]$Release,
+    [switch]$Headless,
     [string]$PythonExecutable = '',
     [string]$SignTool = '',
     [string]$CertificateThumbprint = '',
@@ -12,6 +13,7 @@ $ProjectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 . (Join-Path $ProjectRoot 'build-common.ps1')
 Set-Location -LiteralPath $ProjectRoot
 Assert-ReleaseConfiguration -Release:$Release -SignTool $SignTool -CertificateThumbprint $CertificateThumbprint -TrustedSignerSha256 $TrustedSignerSha256 -TimestampUrl $TimestampUrl
+if ($Headless -and $Release) { throw 'Production release validation requires desktop checks; Headless is for development builds.' }
 if (-not $PythonExecutable) {
     $launcher = (Get-Command py.exe -ErrorAction Stop).Source
     $PythonExecutable = (& $launcher -3.14 -c 'import sys; print(sys.executable)')
@@ -37,13 +39,16 @@ Invoke-NativeChecked -Executable $PythonExecutable -Arguments @('-m', 'venv', '.
 $buildPython = Join-Path $ProjectRoot '.venv-build\Scripts\python.exe'
 Invoke-NativeChecked -Executable $buildPython -Arguments @('-m', 'pip', 'install', '--require-hashes', '--only-binary=:all:', '-r', 'requirements-build.txt')
 Invoke-NativeChecked -Executable $buildPython -Arguments @('-m', 'pip', 'check')
+Invoke-NativeChecked -Executable $buildPython -Arguments @('tools/prepare_piper_assets.py')
 Invoke-NativeChecked -Executable $buildPython -Arguments @('-m', 'unittest', 'discover', '-v')
-Invoke-NativeChecked -Executable $buildPython -Arguments @('tools/smoke_setup_runtime.py')
-Invoke-NativeChecked -Executable $buildPython -Arguments @('tools/smoke_window_layout.py')
-Invoke-NativeChecked -Executable $buildPython -Arguments @('tools/smoke_notification_delivery.py')
-Invoke-NativeChecked -Executable $buildPython -Arguments @('tools/smoke_announcement_layout.py')
+if (-not $Headless) {
+    Invoke-NativeChecked -Executable $buildPython -Arguments @('tools/smoke_setup_runtime.py')
+    Invoke-NativeChecked -Executable $buildPython -Arguments @('tools/smoke_window_layout.py')
+    Invoke-NativeChecked -Executable $buildPython -Arguments @('tools/smoke_notification_delivery.py')
+    Invoke-NativeChecked -Executable $buildPython -Arguments @('tools/smoke_announcement_layout.py')
+} else { Write-Warning 'Headless development build: desktop UI smoke checks were skipped.' }
 Invoke-NativeChecked -Executable $buildPython -Arguments @('tools/write_version_info.py')
-Invoke-NativeChecked -Executable $buildPython -Arguments @('-m', 'PyInstaller', '--noconfirm', '--clean', '--onedir', '--windowed', '--noupx', '--name', 'SLS_Mass_Notify', '--icon', 'assets/favicon.ico', '--version-file', 'build/version_info_app.txt', '--add-data', 'assets/icon.png;.', '--add-data', 'assets/favicon.ico;.', '--add-data', 'assets/audio;audio', 'src/sls_mass_notify.py')
+Invoke-NativeChecked -Executable $buildPython -Arguments @('-m', 'PyInstaller', '--noconfirm', '--clean', '--onedir', '--windowed', '--noupx', '--name', 'SLS_Mass_Notify', '--icon', 'assets/favicon.ico', '--version-file', 'build/version_info_app.txt', '--add-data', 'assets/icon.png;.', '--add-data', 'assets/favicon.ico;.', '--add-data', 'assets/audio;audio', '--add-data', '.tools/tts;tts', '--collect-all', 'piper', '--copy-metadata', 'piper-tts', '--copy-metadata', 'onnxruntime', '--copy-metadata', 'numpy', '--copy-metadata', 'protobuf', '--copy-metadata', 'flatbuffers', '--copy-metadata', 'pathvalidate', 'src/sls_mass_notify.py')
 $AppExe = Join-Path $ProjectRoot 'dist\SLS_Mass_Notify\SLS_Mass_Notify.exe'
 if (-not (Test-Path -LiteralPath $AppExe -PathType Leaf)) { throw 'Application output was not created.' }
 if ($Release) {

@@ -6,7 +6,9 @@ from pathlib import Path
 PINS = {"pip": "26.2.1", "pyinstaller": "6.22.3", "pillow": "12.3.0",
         "defusedxml": "0.7.1", "altgraph": "0.17.5", "packaging": "26.3",
         "pefile": "2024.8.26", "pyinstaller-hooks-contrib": "2026.7",
-        "pywin32-ctypes": "0.2.3", "setuptools": "84.0.0"}
+        "pywin32-ctypes": "0.2.3", "setuptools": "84.0.0",
+        "piper-tts": "1.8.0", "onnxruntime": "1.31.0", "pathvalidate": "3.3.1",
+        "numpy": "2.5.4", "protobuf": "7.36.2", "flatbuffers": "25.12.19"}
 
 
 def main():
@@ -19,7 +21,9 @@ def main():
                   if entry["filename"].endswith(".whl") and not entry.get("yanked")
                   and (entry["filename"].endswith("-none-any.whl")
                        or entry["filename"].endswith("-none-win_amd64.whl")
-                       or entry["filename"].endswith("-cp314-cp314-win_amd64.whl"))]
+                       or entry["filename"].endswith("-cp314-cp314-win_amd64.whl")
+                       or entry["filename"].endswith("-cp39-abi3-win_amd64.whl")
+                       or entry["filename"].endswith("-cp310-abi3-win_amd64.whl"))]
         hashes = sorted({entry["digests"]["sha256"] for entry in wheels})
         if not hashes:
             raise RuntimeError(f"No compatible Windows wheel: {name} {version}")

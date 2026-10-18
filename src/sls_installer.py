@@ -17,7 +17,7 @@ from typing import Callable
 
 from sls_install_safety import (
     FileTransaction, MANIFEST_NAME, TRANSACTION_NAME, PRODUCT_ID, digest, manifest_for,
-    prune_empty, read_manifest, reject_reparse, remove_exact_files,
+    prune_empty, read_manifest, recover_interrupted_upgrade, reject_reparse, remove_exact_files,
     remove_staging, write_json,
 )
 from sls_windowing import fit_window, ScrollableBody
@@ -137,7 +137,7 @@ def relaunch_as_admin() -> bool:
     return bool(result and result > 32)
 
 
-def validate_install_dir(path: Path) -> Path:
+def validate_install_dir(path: Path, *, allow_interrupted: bool = False) -> Path:
     """Allow only protected dedicated machine-install directories with ownership."""
     reject_reparse(path.absolute())
     resolved = path.resolve()
@@ -154,7 +154,9 @@ def validate_install_dir(path: Path) -> Path:
                 break
     if resolved.exists():
         if (resolved / TRANSACTION_NAME).exists():
-            raise RuntimeError("An interrupted upgrade needs administrator recovery; its journal and backup were retained.")
+            if allow_interrupted:
+                return resolved
+            raise RuntimeError("An interrupted upgrade was found. Run setup to verify and recover its files.")
         entries = list(resolved.iterdir())
         if entries:
             installation_manifest(resolved)
@@ -311,7 +313,7 @@ def registered_install_dir() -> Path:
             with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, UNINSTALL_REG_PATH, 0, winreg.KEY_READ) as key:
                 value, _ = winreg.QueryValueEx(key, "InstallLocation")
             candidate = Path(value)
-            return validate_install_dir(candidate)
+            return validate_install_dir(candidate, allow_interrupted=True)
         except (OSError, ValueError):
             pass
     return DEFAULT_INSTALL_DIR
@@ -475,7 +477,12 @@ def install_app(
     progress: ProgressCallback | None = None,
 ) -> None:
     require_admin()
-    install_dir = validate_install_dir(install_dir)
+    install_dir = validate_install_dir(install_dir, allow_interrupted=True)
+    if (install_dir / TRANSACTION_NAME).exists():
+        emit(progress, "Recovering the previous installation after an interrupted upgrade.")
+        stop_running_app(install_dir, progress)
+        recover_interrupted_upgrade(install_dir, secure_directory=verify_protected_directory)
+        install_dir = validate_install_dir(install_dir)
     previous = installation_manifest(install_dir)
     preferences = {"startup_enabled": True, "auto_update_enabled": False}
     if previous and (install_dir / DEFAULTS_NAME).exists():

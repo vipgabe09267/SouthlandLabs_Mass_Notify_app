@@ -26,36 +26,54 @@ The connection test does not send an announcement. Up to three PBX profiles can 
 
 **Releases contain one uploaded asset: the installer EXE.** GitHub also supplies source ZIP/TAR archives automatically. Those are for developers and are not installation packages.
 
+The current source is **1.0.14-beta**, pending release. The download above remains the published **1.0.11-beta** installer.
+
 ## What the app does
 
 | Feature | Behavior |
 | --- | --- |
 | Live delivery | Receives announcements while connected. Messages missed during sleep, shutdown, or disconnection are skipped. |
-| Automatic recovery | Reconnects when the network returns. Gives Windows 90 seconds after startup or wake to restore connectivity without connection-error notices. |
-| Streaming fallback | Checks for new messages every five seconds if streaming fails. Remembers that fallback for 24 hours. |
+| Automatic recovery | Uses Windows suspend/resume and IPv4/IPv6 address-change notifications to retire stale connections. Gives Windows 90 seconds after startup or wake to restore connectivity without connection-error notices. |
+| Streaming fallback | Switches immediately to five-second polling when the PBX reports its streaming pool is full. Remembers that fallback for 24 hours. Other rate-limit errors retain their retry delay. |
 | Visual alerts | Displays colored announcements and image-backed weather alerts in one full-size view. Text remains available in **Details** and as the image loading/failure fallback. |
+| Announcement speech | Reads announcement text aloud with local Piper speech after the notification sound. Enabled by default, with an on/off setting and eight installed voices. |
 | Expiry | Announcements disappear within ten minutes of publication, or earlier when specified by the sender. Weather alerts retain their published expiry. |
 | Receipts | Sends automatic acknowledgements for the exact event ID and retries saved receipts when connectivity returns. |
+| Incident responses | On a compatible PBX, **Respond to incident** offers explicit read, safe, and assistance responses for the assigned desktop participant. Available from the notification and History. |
 | Client version | Reports the packaged app version and supported protocols to the PBX on authenticated requests. |
 | Tray controls | Provides Settings, History, Health, and Exit. Settings includes sound selection, local preview, and diagnostic export. |
 
 Routine notifications have a single **Dismiss** button. Persistent alerts use **I have read this alert**; that action is stored locally. Automatic receipts confirm software receipt, not human reading or safety. Dismiss does not close a backend incident.
 
+For incident announcements from PBX **0.1.6-beta or later**, select **Respond to incident** to load your authorized assignment. A response shows as confirmed only after the PBX confirms it. An unconfirmed response stays saved; use **Retry** to resend the same request. Human safety responses are never retried automatically. Closing or dismissing an alert sends no human response. A network change preserves already displayed alerts while retiring waiting messages; sleep retires both.
+
 Windows fit the monitor's usable area, including its taskbar. Notices appear at the bottom right of the primary screen, with Settings and Dismiss controls. Notices disappear when their fault clears. Brief recovery failures do not produce an error sound. An outage that continues for five minutes after the recovery period produces one notice. Authentication and configuration faults remain visible in **Health** during recovery.
+
+### Announcement speech
+
+In **Settings → Notification sound**, use **Read announcements aloud (Piper)** to turn speech on or off and choose a voice. **English (US) · lessac · low** is the default. The installer also includes Amy low, Lessac medium, Ryan low, French Siwis medium, German Thorsten low, Portuguese (Brazil) Faber medium, and Spanish Davefx medium. Selecting a voice changes pronunciation; it does not translate announcements.
+
+Speech works offline and sends no notification text to a speech service. Announcements play in order after their sound. Dismiss, expiry, sleep, and shutdown cancel their audio; higher-priority alerts interrupt it. Weather alerts keep their notification sound and visual presentation. Reading aloud never submits a read confirmation or safety response.
+
+Speech reads the title and available plain text, up to 2,000 characters and two minutes of audio. Longer text directs the listener to the full announcement on screen. Image-only announcements still display normally but need accompanying text to be spoken. If speech fails, the notification remains available on screen. Temporary speech files are removed after playback or cancellation.
+
+The eight models add about **482 MiB** before installer compression. Builds verify every model and configuration against pinned SHA-256 hashes; the app performs no runtime model downloads. Voice-specific attribution and use restrictions are documented in [third-party notices](THIRD_PARTY_NOTICES.md), with upstream model cards included in the installed app. The bundle is not cleared for unrestricted commercial use.
+
+The complete installer is approximately **540 MiB**. Earlier clients have a smaller update-download limit, so use the release's installer directly when upgrading to this version.
 
 ## PBX compatibility
 
 Existing Basic authentication, endpoint paths, payload schema **1**, and SSE protocol **2** are preserved. Authenticated polling, stream, and receipt requests include:
 
 ```http
-X-SLS-Client-Version: 1.0.11-beta
+X-SLS-Client-Version: 1.0.14-beta
 X-SLS-Payload-Schema: 1
 X-SLS-SSE-Protocol: 2
 ```
 
 The version comes from the packaged application. A compatible PBX records it against the authenticated desktop identity along with reporting time and connection activity. No heartbeat endpoint, administrator credential, or device fingerprint is added.
 
-The server documents [desktop readiness reporting](https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_server/blob/main/docs/DESKTOP_READINESS.md) and [authorized incident responses](https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_server/blob/main/docs/INCIDENT_API.md). This client sends event receipts; it does not yet submit incident human responses. Enrollment, panic activation, and incident response controls require integration with their separate authorized contracts. Incident state must not be inferred from announcement wording or Dismiss.
+The server documents [desktop readiness reporting](https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_server/blob/main/docs/DESKTOP_READINESS.md) and [authorized incident responses](https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_server/blob/main/docs/INCIDENT_API.md). Human responses use `/api/sipnotify/desktop/incident` and `/api/sipnotify/desktop/incident/respond` with the configured desktop's Basic credentials. Only explicit supported incident metadata enables those controls. Incident updates and all-clear announcements retain their separate event identities and expiry; they do not cancel previous popups. Enrollment, panic activation, and fleet administration require their own authorized integration.
 
 ## Settings and troubleshooting
 
@@ -93,7 +111,15 @@ python tools/prepare_workspace_python.py
 .\build-installer.ps1 -Clean -PythonExecutable "$PWD\.tools\python-3.14.7\python.exe"
 ```
 
-The build creates a fresh `.venv-build`, runs unit tests and native UI/delivery/installer checks, and verifies the packaged version, source, and file inventory. `-Clean` replaces generated build and distribution output.
+The build creates a fresh `.venv-build`, downloads hash-pinned voice assets into `.tools/tts`, runs unit tests and native UI/delivery/installer checks, and verifies the packaged version, source, and file inventory. It also synthesizes a short WAV with every packaged voice, without playing sound. `-Clean` replaces generated build and distribution output. Allow space for the eight models in the build cache, application output, and embedded installer payload.
+
+To build without opening any app or installer windows on the current desktop, add `-Headless`. This development-only option runs unit tests and package-integrity checks while skipping desktop smoke checks. It cannot be combined with `-Release`; run full UI validation in a separate Windows test session before releasing.
+
+```powershell
+.\build-installer.ps1 -Headless -PythonExecutable "$PWD\.tools\python-3.14.7\python.exe"
+```
+
+If an upgrade is interrupted, rerun setup. It verifies the protected rollback journal, backup hashes, and destination files before restoring the previous application files. Opening setup and validating a path perform no recovery writes. Unsupported old journals or modified files require administrator review; setup retains their evidence.
 
 ```text
 dist/

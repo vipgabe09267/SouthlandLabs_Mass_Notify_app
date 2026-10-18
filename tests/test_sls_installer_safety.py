@@ -11,6 +11,22 @@ import sls_install_safety as safety
 
 
 class ManifestSafetyTests(unittest.TestCase):
+    def test_path_validation_never_recovers_or_changes_an_interrupted_install(self):
+        with tempfile.TemporaryDirectory() as directory:
+            protected = Path(directory)
+            target = protected / "SLS"
+            target.mkdir()
+            journal = target / safety.TRANSACTION_NAME
+            journal.write_text("journal retained", encoding="utf-8")
+            with mock.patch.object(installer, "program_files_directory", return_value=protected), \
+                 mock.patch.object(installer, "verify_protected_directory"), \
+                 mock.patch.object(installer, "recover_interrupted_upgrade") as recover:
+                with self.assertRaises(RuntimeError):
+                    installer.validate_install_dir(target)
+                self.assertEqual(installer.validate_install_dir(target, allow_interrupted=True), target.resolve())
+            recover.assert_not_called()
+            self.assertEqual(journal.read_text(encoding="utf-8"), "journal retained")
+
     def test_manifest_rejects_traversal_and_windows_alternate_streams(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -131,6 +147,92 @@ class ManifestSafetyTests(unittest.TestCase):
                 with safety.FileTransaction(root, stage, safety.manifest_for(stage, version="2")):
                     pass
             self.assertEqual((root / safety.TRANSACTION_NAME).read_text(), "existing journal")
+
+    def test_verified_interrupted_upgrade_is_rolled_back(self):
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory)
+            root, backup = parent / "install", parent / ".sls-backup-fixture"
+            root.mkdir()
+            backup.mkdir()
+            (backup / "app.exe").write_bytes(b"old")
+            (root / "app.exe").write_bytes(b"new")
+            (root / "new.dll").write_bytes(b"new dependency")
+            previous = {
+                "schema": 1, "product": safety.PRODUCT_ID, "version": "1",
+                "files": {"app.exe": safety.digest(backup / "app.exe")}, "shortcuts": {},
+            }
+            intended = safety.manifest_for(root, version="2")
+            safety.write_json(root / safety.TRANSACTION_NAME, {
+                "schema": 1, "product": safety.PRODUCT_ID, "backup": str(backup),
+                "changes": ["app.exe", "new.dll"], "previous_manifest": previous,
+                "next_manifest": intended,
+            })
+            self.assertTrue(safety.recover_interrupted_upgrade(root))
+            self.assertEqual((root / "app.exe").read_bytes(), b"old")
+            self.assertFalse((root / "new.dll").exists())
+            self.assertEqual(safety.read_manifest(root), previous)
+            self.assertFalse(backup.exists())
+
+    def test_interrupted_upgrade_recovery_refuses_changed_destination(self):
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory)
+            root, backup = parent / "install", parent / ".sls-backup-fixture"
+            root.mkdir()
+            backup.mkdir()
+            (backup / "app.exe").write_bytes(b"old")
+            (root / "app.exe").write_bytes(b"tampered")
+            previous = {
+                "schema": 1, "product": safety.PRODUCT_ID, "version": "1",
+                "files": {"app.exe": safety.digest(backup / "app.exe")}, "shortcuts": {},
+            }
+            intended = {**previous, "version": "2", "files": {"app.exe": "0" * 64}}
+            safety.write_json(root / safety.TRANSACTION_NAME, {
+                "schema": 1, "product": safety.PRODUCT_ID, "backup": str(backup),
+                "changes": ["app.exe"], "previous_manifest": previous,
+                "next_manifest": intended,
+            })
+            with self.assertRaisesRegex(ValueError, "changed after interruption"):
+                safety.recover_interrupted_upgrade(root)
+            self.assertEqual((root / "app.exe").read_bytes(), b"tampered")
+            self.assertTrue((root / safety.TRANSACTION_NAME).exists())
+
+    def test_interrupted_recovery_can_resume_without_consuming_backup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory)
+            root, backup = parent / "install", parent / ".sls-backup-fixture"
+            root.mkdir()
+            backup.mkdir()
+            for name in ("a.exe", "b.dll"):
+                (backup / name).write_bytes(b"old-" + name.encode())
+                (root / name).write_bytes(b"new-" + name.encode())
+            previous = {
+                "schema": 1, "product": safety.PRODUCT_ID, "version": "1", "shortcuts": {},
+                "files": {name: safety.digest(backup / name) for name in ("a.exe", "b.dll")},
+            }
+            intended = safety.manifest_for(root, version="2")
+            safety.write_json(root / safety.TRANSACTION_NAME, {
+                "schema": 1, "product": safety.PRODUCT_ID, "backup": str(backup),
+                "changes": ["a.exe", "b.dll"], "previous_manifest": previous,
+                "next_manifest": intended,
+            })
+            real_replace = safety.os.replace
+            replacements = 0
+
+            def interrupt_second_restore(source, destination):
+                nonlocal replacements
+                if Path(source).name.startswith(".sls-restore-"):
+                    replacements += 1
+                    if replacements == 2:
+                        raise PermissionError("simulated second restore interruption")
+                return real_replace(source, destination)
+
+            with mock.patch.object(safety.os, "replace", side_effect=interrupt_second_restore), \
+                 self.assertRaises(PermissionError):
+                safety.recover_interrupted_upgrade(root)
+            self.assertTrue(backup.exists())
+            self.assertTrue(safety.recover_interrupted_upgrade(root))
+            for name in ("a.exe", "b.dll"):
+                self.assertEqual((root / name).read_bytes(), b"old-" + name.encode())
 
 
 class InstallerFlowTests(unittest.TestCase):

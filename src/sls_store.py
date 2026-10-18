@@ -5,6 +5,7 @@ import contextlib
 import hashlib
 import json
 import math
+import secrets
 import sqlite3
 import threading
 import time
@@ -97,6 +98,13 @@ class Inbox:
                 attempts INTEGER NOT NULL DEFAULT 0,retry_after REAL NOT NULL DEFAULT 0,
                 error TEXT NOT NULL DEFAULT '',UNIQUE(namespace,event_id))""")
             self.db.execute("CREATE INDEX IF NOT EXISTS receipts_to_send ON receipt_outbox(namespace,sent,retry_after)")
+            # Additive table: old clients leave this data intact. Deliberate
+            # human-response retries are separate from the automatic ACK outbox.
+            self.db.execute("""CREATE TABLE IF NOT EXISTS human_response_requests (
+                request_id TEXT PRIMARY KEY, namespace TEXT NOT NULL, incident_id TEXT NOT NULL,
+                response TEXT NOT NULL, created REAL NOT NULL, confirmed REAL)""")
+            self.db.execute("""CREATE UNIQUE INDEX IF NOT EXISTS one_pending_human_response
+                ON human_response_requests(namespace,incident_id) WHERE confirmed IS NULL""")
             self.db.execute("""CREATE TABLE IF NOT EXISTS quarantine (
                 entry_id TEXT PRIMARY KEY, namespace TEXT NOT NULL, event_id TEXT NOT NULL,
                 payload TEXT NOT NULL, error TEXT NOT NULL, received REAL NOT NULL)""")
@@ -358,6 +366,34 @@ class Inbox:
             rows = self.db.execute("SELECT * FROM notifications WHERE instr(lower(payload),lower(?))>0 ORDER BY received DESC LIMIT ?", (query[:200], max(1, min(limit, 1000)))).fetchall()
         return [self._decode(row) for row in rows]
 
+    def pending_human_response(self, namespace: str, incident_id: str) -> dict | None:
+        with self.lock:
+            row = self.db.execute("""SELECT request_id,response FROM human_response_requests
+                WHERE namespace=? AND incident_id=? AND confirmed IS NULL""", (namespace, incident_id)).fetchone()
+            return dict(row) if row else None
+
+    def begin_human_response(self, namespace: str, incident_id: str, response: str) -> dict:
+        from sls_incidents import incident_id as validate_incident_id, RESPONSES
+        validate_incident_id(incident_id)
+        if response not in RESPONSES:
+            raise ValueError("Unsupported human response")
+        with self._transaction():
+            pending = self.pending_human_response(namespace, incident_id)
+            if pending:
+                if pending["response"] != response:
+                    raise ValueError("Retry the saved unconfirmed response before choosing a different response")
+                return pending
+            if self.db.execute("SELECT COUNT(*) FROM human_response_requests WHERE confirmed IS NULL").fetchone()[0] >= 1000:
+                raise InboxFullError("Unconfirmed human-response storage is full; review Health")
+            request_id = secrets.token_hex(16)
+            self.db.execute("""INSERT INTO human_response_requests(request_id,namespace,incident_id,response,created)
+                VALUES(?,?,?,?,?)""", (request_id, namespace, incident_id, response, time.time()))
+            return {"request_id": request_id, "response": response}
+
+    def confirm_human_response(self, request_id: str) -> None:
+        with self._transaction():
+            self.db.execute("UPDATE human_response_requests SET confirmed=? WHERE request_id=?", (time.time(), request_id))
+
     def statistics(self) -> dict:
         with self.lock:
             counts = dict(self.db.execute("SELECT state,COUNT(*) FROM notifications GROUP BY state").fetchall())
@@ -365,6 +401,9 @@ class Inbox:
             rejected = self.db.execute("SELECT COUNT(*) FROM quarantine").fetchone()[0]
             if rejected:
                 counts["quarantined"] = rejected
+            human = self.db.execute("SELECT COUNT(*) FROM human_response_requests WHERE confirmed IS NULL").fetchone()[0]
+            if human:
+                counts["unconfirmed_human_responses"] = human
             return counts
 
     stats = statistics
@@ -378,6 +417,7 @@ class Inbox:
             self.db.execute("DELETE FROM responses WHERE sent IS NOT NULL AND record_id NOT IN (SELECT record_id FROM notifications)")
             self.db.execute("DELETE FROM receipt_outbox WHERE sent IS NOT NULL AND created<?", (cutoff,))
             self.db.execute("DELETE FROM quarantine WHERE received<?", (cutoff,))
+            self.db.execute("DELETE FROM human_response_requests WHERE confirmed IS NOT NULL AND created<?", (cutoff,))
             return result.rowcount
 
     def close(self) -> None:

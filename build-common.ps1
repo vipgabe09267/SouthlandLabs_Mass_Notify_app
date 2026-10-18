@@ -3,8 +3,18 @@ $ErrorActionPreference = 'Stop'
 
 function Invoke-NativeChecked {
     param([Parameter(Mandatory = $true)][string]$Executable, [string[]]$Arguments)
-    & $Executable @Arguments
-    if ($LASTEXITCODE -ne 0) { throw "$Executable failed with exit code $LASTEXITCODE" }
+    if (-not (Test-Path -LiteralPath $Executable -PathType Leaf)) { throw "Executable not found: $Executable" }
+    # Windows PowerShell 5.1 turns redirected native stderr into ErrorRecords.
+    # unittest and PyInstaller normally use stderr for successful progress too.
+    # Normalize that stream to text and decide success from the process exit code.
+    $priorPreference = $ErrorActionPreference
+    $nativeExit = $null
+    try {
+        $ErrorActionPreference = 'Continue'
+        & $Executable @Arguments 2>&1 | ForEach-Object { $_.ToString() }
+        $nativeExit = $LASTEXITCODE
+    } finally { $ErrorActionPreference = $priorPreference }
+    if ($null -eq $nativeExit -or $nativeExit -ne 0) { throw "$Executable failed with exit code $nativeExit" }
 }
 
 function Remove-BuildDirectory {

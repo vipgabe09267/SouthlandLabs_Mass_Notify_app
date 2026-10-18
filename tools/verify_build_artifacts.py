@@ -88,14 +88,19 @@ def main():
                          f"Extra: {sorted(actual_executables - expected_executables)}; "
                          f"missing: {sorted(expected_executables - actual_executables)}")
     application = verify(ROOT / "dist" / "SLS_Mass_Notify", "sls_mass_notify")
-    subprocess.run([str(application), "--check-presentation"], timeout=15,
-                   creationflags=subprocess.CREATE_NO_WINDOW, check=True)
+    from check_speech_runtime import check as check_speech
+    check_speech(application)
+    headless = "--headless" in sys.argv
+    if not headless:
+        subprocess.run([str(application), "--check-presentation"], timeout=15,
+                       creationflags=subprocess.CREATE_NO_WINDOW, check=True)
     installer = verify(ROOT / "build" / "installer-payload" / "SLS_Mass_Notify_Installer", "sls_installer")
     embedded = installer.parent / "_internal" / "SLS_Mass_Notify" / "SLS_Mass_Notify.exe"
     if digest(embedded) != digest(application):
         raise SystemExit("Installer contains a different application payload")
-    subprocess.run([str(installer), "--check-ui"], timeout=45,
-                   creationflags=subprocess.CREATE_NO_WINDOW, check=True)
+    if not headless:
+        subprocess.run([str(installer), "--check-ui"], timeout=45,
+                       creationflags=subprocess.CREATE_NO_WINDOW, check=True)
     bootstrap = distribution / "SLS_Mass_Notify_Installer.exe"
     report = subprocess.run([str(bootstrap), "--check-package"], capture_output=True, text=True,
                             timeout=30, creationflags=subprocess.CREATE_NO_WINDOW, check=True)
@@ -103,6 +108,8 @@ def main():
     if report.stdout.strip() != expected_report:
         raise SystemExit(f"Bootstrap embedded package verification failed: {report.stdout!r}")
     print(f"Verified app and self-contained installer: version {VERSION}, Python 3.14.7, {ssl.OPENSSL_VERSION}; inventories, source bytecode, identical app payload, and bootstrap package self-check.")
+    if headless:
+        print("Headless validation: no app or installer UI was started. Desktop smoke checks remain outstanding.")
 
 
 if __name__ == "__main__":

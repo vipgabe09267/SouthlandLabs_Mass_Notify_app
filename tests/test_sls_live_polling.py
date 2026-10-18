@@ -2,6 +2,7 @@
 import io
 import json
 import threading
+import urllib.error
 from datetime import datetime, timezone
 from unittest import mock
 import sls_mass_notify as client
@@ -102,7 +103,7 @@ class PollingTests(IsolatedClientTest):
                     break
             opened.assert_not_called()
 
-    def test_stream_capacity_backoff_precedes_polling(self):
+    def test_generic_rate_limit_backoff_precedes_polling(self):
         worker = self.worker()
         order = []
         with mock.patch.object(client, "open_sse_response", side_effect=client.RateLimitedError("capacity", 15)), \
@@ -110,3 +111,32 @@ class PollingTests(IsolatedClientTest):
              mock.patch.object(worker, "_run_live_polling", side_effect=lambda: order.append("poll")):
             worker._run_live()
         self.assertEqual(order, [15, "poll"])
+
+    def test_real_stream_capacity_reply_switches_immediately_to_polling(self):
+        worker = self.worker()
+        body = io.BytesIO(json.dumps({"ok": False, "error": "stream_capacity_reached",
+                                     "reason": "php_fpm_worker_pool"}).encode())
+        error = urllib.error.HTTPError(client.pbx_live_url(worker.endpoint_cfg), 429, "Capacity",
+                                       {"Retry-After": "300"}, body)
+        opener = mock.Mock()
+        opener.open.side_effect = error
+        with mock.patch.object(client, "build_http_opener", return_value=opener), \
+             mock.patch.object(worker.stop_event, "wait", side_effect=AssertionError("Capacity fallback must not sleep")), \
+             mock.patch.object(worker, "_run_live_polling") as polling:
+            worker._run_live()
+        polling.assert_called_once_with()
+        self.assertTrue(body.closed)
+
+    def test_stream_capacity_fallback_skips_old_snapshot_and_accepts_new_event(self):
+        worker = self.worker()
+        now = client.time.time()
+        old, fresh = notice("old", now-60), notice("fresh", now+1)
+        replies = [({"ok": True, "events": [old]}, "", now),
+                   ({"ok": True, "events": [old, fresh]}, "", now+5)]
+        with mock.patch.object(client, "open_sse_response", side_effect=client.StreamCapacityError("full", 300)), \
+             mock.patch.object(client, "fetch_endpoint", side_effect=replies), \
+             mock.patch.object(worker.stop_event, "wait", side_effect=[False, True]) as wait:
+            worker._run_live()
+        self.assertEqual(wait.call_args_list, [mock.call(5.0), mock.call(5.0)])
+        self.assertEqual([row["event_id"] for row in self.instance.inbox.history()], ["fresh"])
+        self.assertEqual(self.instance.inbox.pending_receipts(self.namespace)[0]["event_id"], "fresh")

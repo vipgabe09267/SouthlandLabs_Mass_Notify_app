@@ -101,7 +101,7 @@ def main():
                 for name in ("require_admin", "verify_protected_directory", "protect_new_directory", "write_uninstall_registry", "restore_uninstall_registry"):
                     patches.enter_context(mock.patch.object(installer, name))
                 patches.enter_context(mock.patch.object(installer, "registered_install_dir", return_value=target))
-                patches.enter_context(mock.patch.object(installer, "validate_install_dir", side_effect=lambda path: path))
+                patches.enter_context(mock.patch.object(installer, "validate_install_dir", side_effect=lambda path, **_: path))
                 patches.enter_context(mock.patch.object(installer, "snapshot_uninstall_registry", return_value=None))
                 patches.enter_context(mock.patch.object(installer, "machine_shortcuts", return_value=shortcuts))
                 patches.enter_context(mock.patch.object(installer, "stage_payload", side_effect=stage))
