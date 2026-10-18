@@ -192,7 +192,7 @@ def check_file_upgrade():
             (target / "customer-notes.txt").write_text("preserve", encoding="utf-8")
             models = {path.relative_to(target).as_posix(): path.stat().st_ino
                       for path in (target / "_internal" / "tts").glob("*.onnx")}
-            assert len(models) == 8
+            assert list(models) == ["_internal/tts/en_US-lessac-low.onnx"]
             for name in ("require_admin", "verify_protected_directory", "protect_new_directory",
                          "create_protected_directories", "write_uninstall_registry", "restore_uninstall_registry", "stop_running_app"):
                 patches.enter_context(mock.patch.object(installer, name))

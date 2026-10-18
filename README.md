@@ -36,7 +36,7 @@ The next prerelease is **1.0.12-beta**. Announcements can now be read aloud offl
 | Automatic recovery | Uses Windows suspend/resume and IPv4/IPv6 address-change notifications to retire stale connections. Gives Windows 90 seconds after startup or wake to restore connectivity without connection-error notices. |
 | Streaming fallback | Switches immediately to five-second polling when the PBX reports its streaming pool is full. Remembers that fallback for 24 hours. Other rate-limit errors retain their retry delay. |
 | Visual alerts | Displays colored announcements and image-backed weather alerts in one full-size view. Text remains available in **Details** and as the image loading/failure fallback. |
-| Announcement speech | Reads announcement text aloud with local Piper speech after the notification sound. Enabled by default, with an on/off setting and eight installed voices. |
+| Announcement speech | Reads announcement text aloud with local Piper speech after the notification sound. Enabled by default with Lessac low; seven other voices are optional downloads. |
 | Expiry | Announcements disappear within ten minutes of publication, or earlier when specified by the sender. Weather alerts retain their published expiry. |
 | Receipts | Sends automatic acknowledgements for the exact event ID and retries saved receipts when connectivity returns. |
 | Incident responses | On a compatible PBX, **Respond to incident** offers explicit read, safe, and assistance responses for the assigned desktop participant. Available from the notification and History. |
@@ -51,17 +51,19 @@ Windows fit the monitor's usable area, including its taskbar. Notices appear at 
 
 ### Announcement speech
 
-In **Settings → Notification sound**, use **Read announcements aloud (Piper)** to turn speech on or off and choose a voice. **English (US) · lessac · low** is the default. The installer also includes Amy low, Lessac medium, Ryan low, French Siwis medium, German Thorsten low, Portuguese (Brazil) Faber medium, and Spanish Davefx medium. Selecting a voice changes pronunciation; it does not translate announcements.
+In **Settings → Notification sound**, use **Read announcements aloud (Piper)** to turn speech on or off and choose a voice. **English (US) · lessac · low** is included and selected by default. Amy low, Lessac medium, Ryan low, French Siwis medium, German Thorsten low, Portuguese (Brazil) Faber medium, and Spanish Davefx medium are optional downloads. Select one and click **Download voice**; progress and cancellation are available. Each optional voice is about **60 MiB**. Selecting a voice changes pronunciation; it does not translate announcements.
 
 **Test voice** reads a short sample with the currently selected voice, without a chime, PBX connection, or saved-setting change. Its status shows when speech is being prepared and played. This is separate from **Play sound** (chime only), **Local preview** (notification display and audio), and the PBX connection test. Normal announcement speech is prepared during the chime, then played when both are ready; dismissing the announcement cancels its audio. Speech diagnostics record stages, voice names, and timings without recording notification text.
 
-Speech works offline and sends no notification text to a speech service. Announcements play in order after their sound. Dismiss, expiry, sleep, and shutdown cancel their audio; higher-priority alerts interrupt it. Weather alerts keep their notification sound and visual presentation. Reading aloud never submits a read confirmation or safety response.
+Installed voices work offline and send no notification text to a speech service. Downloading a voice requires an internet connection, uses pinned HTTPS sources, and sends no PBX credentials or announcement text. Downloads are verified for size and SHA-256 before installation. If a saved optional voice is missing, announcements use the included Lessac low voice until it is downloaded. **Test voice** is available only when the selected voice is installed.
+
+Announcements play in order after their sound. Dismiss, expiry, sleep, and shutdown cancel their audio; higher-priority alerts interrupt it. Weather alerts keep their notification sound and visual presentation. Reading aloud never submits a read confirmation or safety response.
 
 Speech reads the title and available plain text, up to 2,000 characters and two minutes of audio. Longer text directs the listener to the full announcement on screen. Image-only announcements still display normally but need accompanying text to be spoken. If speech fails, the notification remains available on screen. Temporary speech files are removed after playback or cancellation.
 
-The eight models add about **482 MiB** before installer compression. Builds verify every model and configuration against pinned SHA-256 hashes; the app performs no runtime model downloads. Voice-specific attribution and use restrictions are documented in [third-party notices](THIRD_PARTY_NOTICES.md), with upstream model cards included in the installed app. The bundle is not cleared for unrestricted commercial use.
+The installer bundles only the **60 MiB Lessac low model**, its configuration and attribution, and the catalog of optional voices. Optional models and model cards are stored under `%LOCALAPPDATA%\SouthlandServers\SLS_Mass_Notify\voices\`; updates retain them without downloading them again. Voice-specific attribution and use restrictions are documented in [third-party notices](THIRD_PARTY_NOTICES.md). The models are not cleared for unrestricted commercial use.
 
-The complete installer is approximately **540 MiB**. Earlier clients have a smaller update-download limit, so use the release's installer directly when upgrading to this version.
+The installer is approximately **154 MiB**, reduced from 543 MiB with all eight voices bundled.
 
 ## PBX compatibility
 
@@ -113,9 +115,9 @@ python tools/prepare_workspace_python.py
 .\build-installer.ps1 -Clean -PythonExecutable "$PWD\.tools\python-3.14.7\python.exe"
 ```
 
-The build creates a fresh `.venv-build`, downloads hash-pinned voice assets into `.tools/tts`, runs unit tests and native UI/delivery/installer checks, and verifies the packaged version, source, and file inventory. It also synthesizes a short WAV with every packaged voice, without playing sound. `-Clean` replaces generated build and distribution output. Allow space for the eight models in the build cache, application output, and embedded installer payload.
+The build creates a fresh `.venv-build`, caches the hash-pinned default voice in `.tools/tts`, and stages only Lessac low into `build/tts`. It runs unit tests and native UI/delivery/installer checks and verifies the packaged version, source, and file inventory. It also synthesizes the included voice, downloads optional Amy into an isolated per-user cache, and synthesizes it through the packaged app without playing sound. `-Clean` replaces generated build and distribution output.
 
-Package validation also runs a local preview and a normal announcement through the real audio queue and child synthesizer, verifies a non-silent PCM signal, and intercepts the Windows playback calls so tests stay silent. A full-size file-upgrade fixture checks every resulting file hash, preserves unrelated content, and confirms unchanged voice models were not replaced. This fixture uses temporary folders and mocks machine registration and process control; it does not replace clean-machine deployment testing.
+Package validation also runs a local preview and a normal announcement through the real audio queue and child synthesizer, verifies a non-silent PCM signal, and intercepts the Windows playback calls so tests stay silent. A full-size file-upgrade fixture checks every resulting file hash, preserves unrelated content, and confirms the unchanged default model was not replaced. This fixture uses temporary folders and mocks machine registration and process control; it does not replace clean-machine deployment testing.
 
 To build without opening any app or installer windows on the current desktop, add `-Headless`. This development-only option runs unit tests and package-integrity checks while skipping desktop smoke checks. It cannot be combined with `-Release`; run full UI validation in a separate Windows test session before releasing.
 

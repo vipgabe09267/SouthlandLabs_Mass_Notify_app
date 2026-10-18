@@ -90,8 +90,15 @@ def main():
                          f"Extra: {sorted(actual_executables - expected_executables)}; "
                          f"missing: {sorted(expected_executables - actual_executables)}")
     application = verify(ROOT / "dist" / "SLS_Mass_Notify", "sls_mass_notify")
+    voice_dir = application.parent / "_internal" / "tts"
+    if {path.name for path in voice_dir.glob("*.onnx")} != {"en_US-lessac-low.onnx"}:
+        raise SystemExit("Only Lessac low may be bundled; other voices must be optional downloads")
+    from sls_voices import read_catalog
+    read_catalog(voice_dir / "voices.json")
     from check_speech_runtime import check as check_speech
     check_speech(application)
+    from check_optional_voice_runtime import check as check_optional_voice
+    check_optional_voice(application)
     with tempfile.TemporaryDirectory(prefix="sls-audio-validation-") as temporary:
         report_path = Path(temporary) / "audio.json"
         subprocess.run([str(application), "--check-announcement-audio", str(report_path)],

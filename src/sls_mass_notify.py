@@ -40,6 +40,7 @@ import sls_ipc
 import sls_updates
 from sls_audio import inspect_wav, copy_validated_audio
 from sls_speech import NotificationAudio, DEFAULT_VOICE, VOICES, safe_voice
+from sls_voices import VoiceDownloads, voice_available
 from sls_tray import TrayIcon
 from sls_system_events import RecoverySignals
 from sls_incidents import IncidentClient, IncidentResponseWindow, response_incident
@@ -1723,6 +1724,8 @@ class SettingsWindow:
         self.tts_var = BooleanVar(value=cfg.get("announcement_tts_enabled", True))
         self.tts_voice_var = StringVar(value=VOICES[safe_voice(cfg.get("announcement_tts_voice"))])
         self.tts_status_var = StringVar(value="")
+        self.voice_download_var = StringVar(value="")
+        self._voice_poll_id = None
         self.audio_combo: ttk.Combobox | None = None
         self.endpoint_forms: list[dict] = []
         self.endpoint_panels: list[ttk.Frame] = []
@@ -1733,6 +1736,7 @@ class SettingsWindow:
         self.test_button: ttk.Button | None = None
 
         self._build(cfg)
+        self.poll_voice_download()
         self.window.update_idletasks()
         self._center()
         self.window.lift()
@@ -1881,14 +1885,24 @@ class SettingsWindow:
         ).grid(row=5, column=0, columnspan=4, sticky="w", pady=(12, 0))
         ttk.Checkbutton(audio, text="Read announcements aloud (Piper)", variable=self.tts_var,
                         style="Card.TCheckbutton").grid(row=6, column=0, columnspan=4, sticky="w", pady=(14, 6))
-        ttk.Combobox(audio, textvariable=self.tts_voice_var, values=list(VOICES.values()),
-                     state="readonly", width=36).grid(row=7, column=0, columnspan=4, sticky="ew")
+        voice_combo = ttk.Combobox(audio, textvariable=self.tts_voice_var, values=list(VOICES.values()),
+                                  state="readonly", width=36)
+        voice_combo.grid(row=7, column=0, columnspan=4, sticky="ew")
+        voice_combo.bind("<<ComboboxSelected>>", lambda _event: self.refresh_voice_controls())
         ttk.Label(audio, text="Offline speech after the sound. Voice selection does not translate messages.",
                   style="Hint.TLabel", wraplength=400).grid(row=9, column=0, columnspan=4, sticky="w", pady=(6, 0))
-        ttk.Button(audio, text="Test voice", command=self.test_selected_voice).grid(
-            row=8, column=0, columnspan=4, sticky="w", pady=(8, 0))
+        voice_actions = ttk.Frame(audio, style="Panel.TFrame")
+        voice_actions.grid(row=8, column=0, columnspan=4, sticky="w", pady=(8, 0))
+        self.voice_test_button = ttk.Button(voice_actions, text="Test voice", command=self.test_selected_voice)
+        self.voice_test_button.pack(side="left", padx=(0, 8))
+        self.voice_download_button = ttk.Button(voice_actions, text="Download voice", command=self.download_selected_voice)
+        self.voice_download_button.pack(side="left", padx=(0, 8))
+        self.voice_cancel_button = ttk.Button(voice_actions, text="Cancel", command=self.app.voice_downloads.cancel)
+        self.voice_cancel_button.pack(side="left")
         ttk.Label(audio, textvariable=self.tts_status_var, style="Hint.TLabel", wraplength=400).grid(
             row=10, column=0, columnspan=4, sticky="w", pady=(6, 0))
+        ttk.Label(audio, textvariable=self.voice_download_var, style="Hint.TLabel", wraplength=400).grid(
+            row=11, column=0, columnspan=4, sticky="w", pady=(6, 0))
         audio.columnconfigure(0, weight=1)
         self.refresh_audio_choices()
 
@@ -2060,7 +2074,48 @@ class SettingsWindow:
 
     def test_selected_voice(self) -> None:
         voice = next((key for key, label in VOICES.items() if label == self.tts_voice_var.get()), DEFAULT_VOICE)
+        if not voice_available(voice):
+            self.tts_status_var.set("Download this voice before testing it.")
+            return
         self.app.test_announcement_voice(voice)
+
+    def selected_voice(self):
+        return next((key for key, label in VOICES.items() if label == self.tts_voice_var.get()), DEFAULT_VOICE)
+
+    def download_selected_voice(self):
+        voice = self.selected_voice()
+        if voice != DEFAULT_VOICE:
+            self.app.voice_downloads.start(voice)
+        self.refresh_voice_controls()
+
+    def refresh_voice_controls(self):
+        voice = self.selected_voice()
+        installed = voice_available(voice)
+        status = self.app.voice_downloads.status()
+        busy = status["state"] in {"downloading", "cancelling"}
+        self.voice_test_button.configure(state="normal" if installed else "disabled")
+        self.voice_download_button.configure(
+            text="Included" if voice == DEFAULT_VOICE else ("Repair download" if installed else "Download voice"),
+            state="disabled" if busy or voice == DEFAULT_VOICE else "normal")
+        self.voice_cancel_button.configure(state="normal" if busy else "disabled")
+        if status["state"] == "cancelling":
+            message = "Cancelling voice download…"
+        elif busy:
+            percent = min(100, int(100 * status["bytes"] / max(1, status["total"])))
+            message = f"Downloading {VOICES[status['voice']]}: {percent}%"
+        elif status["voice"] == voice and status["state"] in {"failed", "cancelled"}:
+            message = ("Download failed. Check your connection and retry." if status["state"] == "failed"
+                       else "Download cancelled. You can retry at any time.")
+        else:
+            message = ("Included; works offline." if voice == DEFAULT_VOICE else
+                       "Installed; works offline." if installed else
+                       "Download required (about 60 MiB). Announcements use Lessac low until this voice is installed.")
+        self.voice_download_var.set(message)
+
+    def poll_voice_download(self):
+        if self.window.winfo_exists():
+            self.refresh_voice_controls()
+            self._voice_poll_id = self.window.after(500, self.poll_voice_download)
 
     def play_selected_audio(self) -> None:
         name = safe_audio_name(self.audio_var.get() or DEFAULT_AUDIO_NAME)
@@ -2211,6 +2266,9 @@ class SettingsWindow:
         if self.app.tray is not None and not self.app.tray.available:
             self.window.iconify()
             return
+        if self._voice_poll_id is not None:
+            self.window.after_cancel(self._voice_poll_id)
+            self._voice_poll_id = None
         self.window.destroy()
         self.app.settings_window = None
 
@@ -2798,6 +2856,7 @@ class MassNotifyApp:
             on_activity=self.speech_activity,
             enabled=self.config.get("announcement_tts_enabled", True),
             voice=self.config.get("announcement_tts_voice", DEFAULT_VOICE))
+        self.voice_downloads = VoiceDownloads()
         self.presenter = AlertPresenter(root,
             on_displayed=self.alert_displayed, on_acknowledged=self.alert_acknowledged,
             on_failed=self.alert_failed,
@@ -3576,6 +3635,7 @@ class MassNotifyApp:
         self.wakeup_event.set()
         self.presenter.shutdown()
         self.notification_audio.close()
+        self.voice_downloads.cancel()
         with self.worker_lock:
             workers = list(self.workers.values())
             self.workers.clear()

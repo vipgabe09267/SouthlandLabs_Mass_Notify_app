@@ -54,6 +54,7 @@ class IsolatedClientTest(unittest.TestCase):
                                                        password="old password", enabled=True), 0)
         self.instance = client.MassNotifyApp.__new__(client.MassNotifyApp)
         self.instance.notification_audio = mock.Mock()
+        self.instance.voice_downloads = mock.Mock()
         instance = self.instance
         instance.config = client.normalize_config({"enabled": True, "endpoints": [self.profile]})
         instance.config_lock = threading.RLock()

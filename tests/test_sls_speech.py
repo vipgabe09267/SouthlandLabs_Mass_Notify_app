@@ -92,7 +92,8 @@ class SettingsTests(IsolatedClientTest):
         window = client.SettingsWindow.__new__(client.SettingsWindow)
         window.app = self.instance
         window.tts_voice_var = Mock(get=lambda: speech.VOICES["fr_FR-siwis-medium"])
-        window.test_selected_voice()
+        with patch.object(client, "voice_available", return_value=True):
+            window.test_selected_voice()
         call = self.instance.notification_audio.submit.call_args
         self.assertEqual(call.kwargs["voice"], "fr_FR-siwis-medium")
         self.assertIs(call.kwargs["speech_enabled"], True)
@@ -160,6 +161,7 @@ class QueueTests(unittest.TestCase):
         self.controller = None
 
     def make(self, **kwargs):
+        kwargs.setdefault("resolve_voice", lambda voice: voice)
         self.controller = speech.NotificationAudio(
             tone=kwargs.pop("tone", lambda alert: self.tones.append(alert) or 0),
             stop=self.stop, on_error=self.errors.append,
