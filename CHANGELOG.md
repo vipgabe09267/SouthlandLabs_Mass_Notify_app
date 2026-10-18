@@ -1,6 +1,6 @@
 # Changelog
 
-## 1.0.15-beta - 2026-10-17
+## 1.0.12-beta - 2026-10-17
 
 - Prepare announcement speech while the notification chime is playing, instead of adding synthesis time after the chime. Add a dedicated Test voice control with preparation/playback status and private diagnostic timings.
 - Verify local preview and a normal announcement through the packaged presenter, audio queue, child synthesis, non-silent PCM, and intercepted Windows playback calls. Voice model synthesis alone is no longer the only speech integration check.
