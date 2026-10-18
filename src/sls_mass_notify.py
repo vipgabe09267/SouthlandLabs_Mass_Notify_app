@@ -1722,6 +1722,7 @@ class SettingsWindow:
         self.audio_var = StringVar(value=safe_audio_name(safe_string(cfg.get("audio_sound")) or DEFAULT_AUDIO_NAME))
         self.tts_var = BooleanVar(value=cfg.get("announcement_tts_enabled", True))
         self.tts_voice_var = StringVar(value=VOICES[safe_voice(cfg.get("announcement_tts_voice"))])
+        self.tts_status_var = StringVar(value="")
         self.audio_combo: ttk.Combobox | None = None
         self.endpoint_forms: list[dict] = []
         self.endpoint_panels: list[ttk.Frame] = []
@@ -1883,7 +1884,11 @@ class SettingsWindow:
         ttk.Combobox(audio, textvariable=self.tts_voice_var, values=list(VOICES.values()),
                      state="readonly", width=36).grid(row=7, column=0, columnspan=4, sticky="ew")
         ttk.Label(audio, text="Offline speech after the sound. Voice selection does not translate messages.",
-                  style="Hint.TLabel", wraplength=400).grid(row=8, column=0, columnspan=4, sticky="w", pady=(6, 0))
+                  style="Hint.TLabel", wraplength=400).grid(row=9, column=0, columnspan=4, sticky="w", pady=(6, 0))
+        ttk.Button(audio, text="Test voice", command=self.test_selected_voice).grid(
+            row=8, column=0, columnspan=4, sticky="w", pady=(8, 0))
+        ttk.Label(audio, textvariable=self.tts_status_var, style="Hint.TLabel", wraplength=400).grid(
+            row=10, column=0, columnspan=4, sticky="w", pady=(6, 0))
         audio.columnconfigure(0, weight=1)
         self.refresh_audio_choices()
 
@@ -2052,6 +2057,10 @@ class SettingsWindow:
         if self.audio_combo is not None:
             self.audio_combo.configure(values=choices)
         self.audio_var.set(selected)
+
+    def test_selected_voice(self) -> None:
+        voice = next((key for key, label in VOICES.items() if label == self.tts_voice_var.get()), DEFAULT_VOICE)
+        self.app.test_announcement_voice(voice)
 
     def play_selected_audio(self) -> None:
         name = safe_audio_name(self.audio_var.get() or DEFAULT_AUDIO_NAME)
@@ -2786,6 +2795,7 @@ class MassNotifyApp:
             stop=lambda: winsound.PlaySound(None, 0) if winsound else None,
             on_error=lambda message: self.record_fault("speech", message),
             on_success=lambda: self.clear_fault("speech"),
+            on_activity=self.speech_activity,
             enabled=self.config.get("announcement_tts_enabled", True),
             voice=self.config.get("announcement_tts_voice", DEFAULT_VOICE))
         self.presenter = AlertPresenter(root,
@@ -2841,6 +2851,10 @@ class MassNotifyApp:
             self.record_fault("audio", f"Notification sound could not play: {exc}")
             log(f"Notification sound failed: {exc}")
             return 0.0
+
+    def speech_activity(self, stage: str, voice: str, elapsed: float) -> None:
+        log(f"Announcement audio {stage}; voice={voice}; elapsed={elapsed:.2f}s")
+        self.ui_queue.put(("speech_status", stage))
 
     def alert_displayed(self, record_id: str) -> None:
         if not record_id.startswith("preview-"):
@@ -3051,6 +3065,12 @@ class MassNotifyApp:
         self.present_alert(extract_alert({"kind": "announcement", "title": "Local notification preview",
             "body": "This is a local display and sound test. No notification was sent to the PBX or other devices.",
             "priority": "notice", "is_test": True, "test_only": True}, ""))
+
+    def test_announcement_voice(self, voice: str) -> None:
+        self.notification_audio.submit("voice-test-" + secrets.token_hex(8),
+            {"kind": "announcement", "title": "Voice test",
+             "body": "This is a test of your selected announcement voice.", "raw": {"is_test": True}},
+            3, time.time() + 30, voice=safe_voice(voice), speech_enabled=True, tone_enabled=False)
 
     def is_configured(self) -> bool:
         with self.config_lock:
@@ -3384,6 +3404,12 @@ class MassNotifyApp:
                         self.fault_toast.hide()
                     self.fault_toast = FaultToast(self, message)
                     self.fault_toast.fault_key, self.fault_toast.fault_token = key, token
+                elif kind == "speech_status":
+                    if self.settings_window is not None and self.settings_window.window.winfo_exists():
+                        messages = {"preparing": "Preparing speech…", "playing": "Reading aloud…",
+                                    "finished": "Speech finished.", "cancelled": "Speech stopped."}
+                        self.settings_window.tts_status_var.set(messages.get(value,
+                            "Speech unavailable. See Health for details."))
                 elif kind == "settings":
                     self.show_settings()
                 elif kind == "history":
@@ -3577,6 +3603,14 @@ class MassNotifyApp:
 
 
 def main() -> None:
+    if len(sys.argv) == 3 and sys.argv[1] == "--check-announcement-audio":
+        from sls_speech_probe import check
+        try:
+            report = check(sys.modules[__name__])
+            Path(sys.argv[2]).write_text(json.dumps(report), encoding="utf-8")
+        except Exception:
+            raise SystemExit(1) from None
+        return
     if len(sys.argv) == 4 and sys.argv[1] == "--synthesize-announcement":
         from sls_speech import synthesize_file
         try:

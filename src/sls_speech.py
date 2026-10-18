@@ -137,14 +137,19 @@ class AudioJob:
     priority: int
     expires: float | None
     cancelled: threading.Event
+    voice: str | None = None
+    speech_enabled: bool | None = None
+    tone_enabled: bool = True
+    queued_at: float = 0.0
 
 
 class NotificationAudio:
     """Serialize tones and speech; higher priority alerts interrupt immediately."""
-    def __init__(self, *, tone, stop, on_error, on_success=None, enabled=True, voice=DEFAULT_VOICE,
+    def __init__(self, *, tone, stop, on_error, on_success=None, on_activity=None, enabled=True, voice=DEFAULT_VOICE,
                  synthesize=synthesize_hidden, play=None):
         self._tone, self._stop, self._on_error = tone, stop, on_error
         self._on_success = on_success
+        self._on_activity = on_activity
         self._synthesize, self._play = synthesize, play
         self._enabled = bool(enabled)
         self._voice = safe_voice(voice)
@@ -162,7 +167,7 @@ class NotificationAudio:
         except Exception:
             pass  # A failing output device must not prevent cancellation.
 
-    def submit(self, record_id, alert, priority, expires=None):
+    def submit(self, record_id, alert, priority, expires=None, *, voice=None, speech_enabled=None, tone_enabled=True):
         with self._condition:
             if self._closed or record_id in self._completed:
                 return
@@ -175,7 +180,9 @@ class NotificationAudio:
             if self._active and priority < self._active.priority:
                 self._active.cancelled.set()
                 self._halt()
-            job = AudioJob(record_id, alert, priority, expires, threading.Event())
+            job = AudioJob(record_id, alert, priority, expires, threading.Event(),
+                           safe_voice(voice) if voice is not None else None,
+                           speech_enabled, tone_enabled, time.monotonic())
             self._pending.append(job)
             self._pending.sort(key=lambda j: j.priority)  # Stable FIFO per priority.
             self._condition.notify()
@@ -216,7 +223,7 @@ class NotificationAudio:
     def _play_file(self, job, path):
         duration = inspect_wav(path).seconds
         with self._condition:
-            if not self._valid(job) or not self._enabled:
+            if not self._valid(job) or not self._speech_enabled(job):
                 return
             if self._play is not None:
                 self._play(path)
@@ -227,6 +234,16 @@ class NotificationAudio:
         with self._condition:
             self._halt()
 
+    def _speech_enabled(self, job):
+        return self._enabled if job.speech_enabled is None else job.speech_enabled
+
+    def _activity(self, job, stage):
+        if self._on_activity:
+            try:
+                self._on_activity(stage, job.voice or self._voice, time.monotonic() - job.queued_at)
+            except Exception:
+                pass  # Diagnostics must never interrupt notification playback.
+
     def _run(self):
         while True:
             with self._condition:
@@ -235,28 +252,45 @@ class NotificationAudio:
                     return
                 job = self._pending.pop(0)
                 self._active = job
+            failed = False
+            preparing = False
+            tone_finished = time.monotonic()
             try:
                 with self._condition:
-                    duration = self._tone(job.alert) if self._valid(job) else 0
-                if not self._wait(job, duration):
-                    continue
+                    duration = self._tone(job.alert) if self._valid(job) and job.tone_enabled else 0
+                tone_finished = time.monotonic() + max(0, min(float(duration), MAX_SPEECH_SECONDS))
                 text = announcement_text(job.alert)
                 with self._condition:
-                    speak = self._enabled and bool(text) and self._valid(job)
-                    voice = self._voice
+                    speak = self._speech_enabled(job) and bool(text) and self._valid(job)
+                    voice = job.voice or self._voice
                 if speak:
+                    preparing = True
+                    self._activity(job, "preparing")
                     with tempfile.TemporaryDirectory(prefix="sls-speech-") as directory:
                         output = Path(directory) / "speech.wav"
-                        if self._synthesize(text, output, job.cancelled, voice) and self._valid(job):
+                        # The tone is asynchronous: synthesize while it plays,
+                        # then wait only for any remaining tone, not both delays.
+                        if (self._synthesize(text, output, job.cancelled, voice)
+                                and self._wait(job, max(0, tone_finished - time.monotonic()))):
+                            self._activity(job, "playing")
                             self._play_file(job, output)
                             if self._valid(job) and self._on_success:
                                 self._on_success()
-            except Exception:
+                else:
+                    self._wait(job, max(0, tone_finished - time.monotonic()))
+            except Exception as exc:
+                failed = True
                 # Never log message text or pass it to an external service.
+                self._activity(job, "failed:" + type(exc).__name__)
                 self._on_error("Announcement audio could not play. Read the notification on screen.")
+                self._wait(job, max(0, tone_finished - time.monotonic()))
             finally:
                 with self._condition:
                     self._halt()
                     if self._valid(job):
                         self._completed.append(job.record_id)
+                        if preparing and not failed:
+                            self._activity(job, "finished")
+                    elif preparing:
+                        self._activity(job, "cancelled")
                     self._active = None

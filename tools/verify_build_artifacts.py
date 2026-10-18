@@ -6,6 +6,7 @@ import os
 import ssl
 import sys
 import subprocess
+import tempfile
 import types
 from pathlib import Path
 
@@ -91,6 +92,15 @@ def main():
     application = verify(ROOT / "dist" / "SLS_Mass_Notify", "sls_mass_notify")
     from check_speech_runtime import check as check_speech
     check_speech(application)
+    with tempfile.TemporaryDirectory(prefix="sls-audio-validation-") as temporary:
+        report_path = Path(temporary) / "audio.json"
+        subprocess.run([str(application), "--check-announcement-audio", str(report_path)],
+                       timeout=60, check=True, creationflags=subprocess.CREATE_NO_WINDOW)
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+        if report.get("voice_playback_calls") != 2:
+            raise SystemExit("Packaged announcement audio did not reach both intercepted playback calls")
+        print("Verified packaged local preview and announcement through presenter, audio queue, "
+              "child synthesis, non-silent PCM, and intercepted Windows playback; no windows or sound.")
     headless = "--headless" in sys.argv
     if not headless:
         subprocess.run([str(application), "--check-presentation"], timeout=15,

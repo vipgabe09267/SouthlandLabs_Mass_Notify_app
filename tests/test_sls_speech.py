@@ -87,6 +87,20 @@ class TextTests(unittest.TestCase):
 
 
 class SettingsTests(IsolatedClientTest):
+    def test_voice_button_uses_unsaved_selection_without_changing_saved_preferences(self):
+        original = self.instance.get_config()
+        window = client.SettingsWindow.__new__(client.SettingsWindow)
+        window.app = self.instance
+        window.tts_voice_var = Mock(get=lambda: speech.VOICES["fr_FR-siwis-medium"])
+        window.test_selected_voice()
+        call = self.instance.notification_audio.submit.call_args
+        self.assertEqual(call.kwargs["voice"], "fr_FR-siwis-medium")
+        self.assertIs(call.kwargs["speech_enabled"], True)
+        self.assertIs(call.kwargs["tone_enabled"], False)
+        self.assertTrue(call.args[0].startswith("voice-test-"))
+        self.assertEqual(self.instance.get_config(), original)
+        self.assertFalse(client.CONFIG_PATH.exists())
+
     def test_speech_preferences_are_saved_and_applied_without_changing_authentication(self):
         self.instance.update_settings(endpoints=[self.profile], enabled=True,
             startup_enabled=True, auto_update_enabled=False, audio_sound=client.DEFAULT_AUDIO_NAME,
@@ -108,6 +122,32 @@ class SettingsTests(IsolatedClientTest):
 
 
 class QueueTests(unittest.TestCase):
+    def test_synthesis_starts_while_tone_is_still_playing(self):
+        started = threading.Event()
+        def synth(text, path, cancelled, voice):
+            started.set()
+            wav(path)
+            return True
+        audio = self.make(tone=lambda alert: 30, synthesize=synth)
+        audio.submit("one", announcement(), 3)
+        self.assertTrue(started.wait(1), "Speech preparation must not wait for the entire tone")
+        self.assertFalse(self.played, "Prepared speech must not interrupt the tone")
+        audio.cancel("one")
+        self.idle()
+
+    def test_voice_test_uses_selected_voice_when_disabled_without_changing_preferences(self):
+        audio = self.make(enabled=False, voice="en_US-lessac-low")
+        audio.submit("preview", announcement(), 3, voice="es_ES-davefx-medium",
+                     speech_enabled=True, tone_enabled=False)
+        self.idle()
+        self.assertFalse(self.tones)
+        self.assertEqual(self.spoken[0][1], "es_ES-davefx-medium")
+        self.assertFalse(audio._enabled)
+        self.assertEqual(audio._voice, "en_US-lessac-low")
+        audio.submit("normal", announcement(), 3)
+        self.idle()
+        self.assertEqual(len(self.spoken), 1)
+
     def setUp(self):
         self.spoken, self.tones, self.played, self.errors = [], [], [], []
         self.finished = threading.Event()

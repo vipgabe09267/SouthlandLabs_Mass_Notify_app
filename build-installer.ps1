@@ -35,6 +35,7 @@ Remove-BuildDirectory -Root $ProjectRoot -Name 'dist\SLS_Mass_Notify_Installer'
 $verifyArgs = @('tools/verify_build_artifacts.py')
 if ($Headless) { $verifyArgs += '--headless' }
 Invoke-NativeChecked -Executable $buildPython -Arguments $verifyArgs
+Invoke-NativeChecked -Executable $buildPython -Arguments @('tools/smoke_setup_runtime.py', '--files-only')
 if (-not $Headless) { Invoke-NativeChecked -Executable $buildPython -Arguments @('tools/smoke_setup_runtime.py', '--full-payload') }
 $packageItems = @($bootstrap)
 $packageDirectory = Join-Path $ProjectRoot 'dist\packages'

@@ -127,6 +127,12 @@ def recover_interrupted_upgrade(root: Path, *, secure_directory=None) -> bool:
     known = set(previous.get("files", {})) | set(intended["files"])
     if any(name not in known for name in changes):
         raise ValueError("The interrupted-upgrade journal references an unowned path.")
+    missing_before = journal.get("missing_before", [])
+    if (not isinstance(missing_before, list) or any(not isinstance(name, str) for name in missing_before)
+            or len(set(missing_before)) != len(missing_before)
+            or any(name not in changes or name not in previous.get("files", {}) for name in missing_before)):
+        raise ValueError("The upgrade journal contains an invalid missing-file inventory.")
+    missing_before = set(missing_before)
 
     backup_text = journal.get("backup")
     if not isinstance(backup_text, str):
@@ -146,7 +152,10 @@ def recover_interrupted_upgrade(root: Path, *, secure_directory=None) -> bool:
     for name in changes:
         target, original = owned_path(root, name), owned_path(backup, name)
         old_hash, new_hash = old_files.get(name), new_files.get(name)
-        if old_hash:
+        if name in missing_before:
+            if original.exists():
+                raise ValueError(f"Unexpected backup for a previously missing file: {original}")
+        elif old_hash:
             if original.exists():
                 if not original.is_file() or digest(original) != old_hash:
                     raise ValueError(f"Interrupted-upgrade backup failed verification: {original}")
@@ -163,7 +172,7 @@ def recover_interrupted_upgrade(root: Path, *, secure_directory=None) -> bool:
 
     for name in reversed(changes):
         target, original = owned_path(root, name), owned_path(backup, name)
-        if name in old_files:
+        if name in old_files and name not in missing_before:
             if original.exists():
                 target.parent.mkdir(parents=True, exist_ok=True)
                 handle, temporary_name = tempfile.mkstemp(prefix=".sls-restore-", dir=target.parent)
@@ -282,7 +291,8 @@ class FileTransaction:
         self.stage = stage
         self.manifest = manifest
         self.previous = read_manifest(root, required=False) if previous is None else previous
-        _validated_journal_manifest(root, self.previous, empty_allowed=True)
+        if previous is not None:
+            _validated_journal_manifest(root, self.previous, empty_allowed=True)
         _validated_journal_manifest(root, self.manifest)
         # Windows filenames are case-insensitive. Preserve the installed spelling
         # for shared paths so each file is checked, backed up and replaced once.
@@ -315,26 +325,44 @@ class FileTransaction:
                 self.secure_directory(self.root)
             if (self.root / TRANSACTION_NAME).exists():
                 raise RuntimeError("An interrupted upgrade requires recovery before another installation.")
-            self.started = True
-            for name in set(old_files) | set(self.manifest["files"]):
+            missing_before = []
+            planned = []
+            for name in sorted(set(old_files) | set(self.manifest["files"])):
                 target = owned_path(self.root, name)
-                if target.exists():
+                exists = target.exists()
+                if exists:
                     if name not in old_files or not target.is_file() or digest(target) != old_files[name]:
                         raise ValueError(f"Refusing to replace an unowned or changed file: {target}")
+                new_hash = self.manifest["files"].get(name)
+                if exists and old_files.get(name) == new_hash:
+                    continue  # Verified identical content does not need replacement or backup.
+                if not exists and new_hash is None:
+                    continue  # A retired file that is already missing needs no file operation.
+                planned.append(name)
+                if exists:
                     backup_file = owned_path(self.backup, name)
                     backup_file.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(target, backup_file)
+                    if digest(backup_file) != old_files[name]:
+                        raise ValueError(f"Upgrade backup failed verification: {backup_file}")
+                    with backup_file.open("r+b") as backup_stream:
+                        os.fsync(backup_stream.fileno())
+                elif name in old_files:
+                    missing_before.append(name)
             if self.original_manifest is not None:
                 (self.backup / MANIFEST_NAME).write_bytes(self.original_manifest)
-            for name in sorted(set(old_files) | set(self.manifest["files"])):
-                # Journal before changing the destination, so rollback is safe
-                # even when replacement fails after the OS has accepted it.
-                self.changes.append(name)
-                write_json(self.root / TRANSACTION_NAME, {
-                    "schema": 1, "product": PRODUCT_ID, "backup": str(self.backup),
-                    "changes": self.changes, "previous_manifest": self.previous,
-                    "next_manifest": self.manifest,
-                })
+            # Back up the complete plan, then persist it once before any change.
+            # Recovery verifies/restores every planned path, including ones the
+            # interrupted process had not reached. Rewriting this growing JSON
+            # for every file caused quadratic I/O and thousands of disk flushes.
+            self.changes = planned
+            self.started = True
+            write_json(self.root / TRANSACTION_NAME, {
+                "schema": 1, "product": PRODUCT_ID, "backup": str(self.backup),
+                "changes": self.changes, "previous_manifest": self.previous,
+                "next_manifest": self.manifest, "missing_before": missing_before,
+            })
+            for name in self.changes:
                 target = owned_path(self.root, name)
                 if name in self.manifest["files"]:
                     source = owned_path(self.stage, self.stage_sources[name])
@@ -386,5 +414,5 @@ class FileTransaction:
             self.rollback()
         else:
             remove_staging(self.backup)
-            prune_empty(self.root, list(self.previous.get("files", {})))
+            prune_empty(self.root, [name for name in self.changes if name not in self.manifest["files"]])
         return False

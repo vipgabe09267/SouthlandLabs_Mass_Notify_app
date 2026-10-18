@@ -26,7 +26,7 @@ The connection test does not send an announcement. Up to three PBX profiles can 
 
 **Releases contain one uploaded asset: the installer EXE.** GitHub also supplies source ZIP/TAR archives automatically. Those are for developers and are not installation packages.
 
-The current source is **1.0.14-beta**, pending release. The download above remains the published **1.0.11-beta** installer.
+The current source is **1.0.15-beta**, pending release. The download above remains the published **1.0.11-beta** installer.
 
 ## What the app does
 
@@ -53,6 +53,8 @@ Windows fit the monitor's usable area, including its taskbar. Notices appear at 
 
 In **Settings → Notification sound**, use **Read announcements aloud (Piper)** to turn speech on or off and choose a voice. **English (US) · lessac · low** is the default. The installer also includes Amy low, Lessac medium, Ryan low, French Siwis medium, German Thorsten low, Portuguese (Brazil) Faber medium, and Spanish Davefx medium. Selecting a voice changes pronunciation; it does not translate announcements.
 
+**Test voice** reads a short sample with the currently selected voice, without a chime, PBX connection, or saved-setting change. Its status shows when speech is being prepared and played. This is separate from **Play sound** (chime only), **Local preview** (notification display and audio), and the PBX connection test. Normal announcement speech is prepared during the chime, then played when both are ready; dismissing the announcement cancels its audio. Speech diagnostics record stages, voice names, and timings without recording notification text.
+
 Speech works offline and sends no notification text to a speech service. Announcements play in order after their sound. Dismiss, expiry, sleep, and shutdown cancel their audio; higher-priority alerts interrupt it. Weather alerts keep their notification sound and visual presentation. Reading aloud never submits a read confirmation or safety response.
 
 Speech reads the title and available plain text, up to 2,000 characters and two minutes of audio. Longer text directs the listener to the full announcement on screen. Image-only announcements still display normally but need accompanying text to be spoken. If speech fails, the notification remains available on screen. Temporary speech files are removed after playback or cancellation.
@@ -66,7 +68,7 @@ The complete installer is approximately **540 MiB**. Earlier clients have a smal
 Existing Basic authentication, endpoint paths, payload schema **1**, and SSE protocol **2** are preserved. Authenticated polling, stream, and receipt requests include:
 
 ```http
-X-SLS-Client-Version: 1.0.14-beta
+X-SLS-Client-Version: 1.0.15-beta
 X-SLS-Payload-Schema: 1
 X-SLS-SSE-Protocol: 2
 ```
@@ -113,6 +115,8 @@ python tools/prepare_workspace_python.py
 
 The build creates a fresh `.venv-build`, downloads hash-pinned voice assets into `.tools/tts`, runs unit tests and native UI/delivery/installer checks, and verifies the packaged version, source, and file inventory. It also synthesizes a short WAV with every packaged voice, without playing sound. `-Clean` replaces generated build and distribution output. Allow space for the eight models in the build cache, application output, and embedded installer payload.
 
+Package validation also runs a local preview and a normal announcement through the real audio queue and child synthesizer, verifies a non-silent PCM signal, and intercepts the Windows playback calls so tests stay silent. A full-size file-upgrade fixture checks every resulting file hash, preserves unrelated content, and confirms unchanged voice models were not replaced. This fixture uses temporary folders and mocks machine registration and process control; it does not replace clean-machine deployment testing.
+
 To build without opening any app or installer windows on the current desktop, add `-Headless`. This development-only option runs unit tests and package-integrity checks while skipping desktop smoke checks. It cannot be combined with `-Release`; run full UI validation in a separate Windows test session before releasing.
 
 ```powershell
@@ -122,6 +126,8 @@ To build without opening any app or installer windows on the current desktop, ad
 If an upgrade is interrupted, rerun setup. It verifies the protected rollback journal, backup hashes, and destination files before restoring the previous application files. Opening setup and validating a path perform no recovery writes. Unsupported old journals or modified files require administrator review; setup retains their evidence.
 
 Upgrades recognize filename capitalization changes in bundled Windows runtime DLLs. Setup still verifies each installed file against its previous manifest hash before replacing it; a genuinely modified or unowned file is retained for review.
+
+Verified unchanged files, including the large voice models, stay in place during an update. Setup backs up changed files and saves the complete recovery plan once before replacing anything. Recovery checks every planned path, including files an interrupted update had not reached.
 
 Both app and setup include their Tcl/Tk script libraries. The package check constructs setup with its window withdrawn and clears build-time library paths to verify that its UI runtime is self-contained.
 
