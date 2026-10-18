@@ -282,6 +282,17 @@ class FileTransaction:
         self.stage = stage
         self.manifest = manifest
         self.previous = read_manifest(root, required=False) if previous is None else previous
+        _validated_journal_manifest(root, self.previous, empty_allowed=True)
+        _validated_journal_manifest(root, self.manifest)
+        # Windows filenames are case-insensitive. Preserve the installed spelling
+        # for shared paths so each file is checked, backed up and replaced once.
+        # Staging may use a different spelling (e.g. VCRUNTIME140.dll), so retain
+        # its source names separately. Journals then use identical keys for both
+        # versions and remain safe to recover after an interrupted replacement.
+        installed_names = {name.casefold(): name for name in self.previous.get("files", {})}
+        incoming_files = self.manifest["files"]
+        self.stage_sources = {installed_names.get(name.casefold(), name): name for name in incoming_files}
+        self.manifest["files"] = {name: incoming_files[source] for name, source in self.stage_sources.items()}
         self.backup = Path(tempfile.mkdtemp(prefix=".sls-backup-", dir=root.parent))
         self.secure_directory = secure_directory
         if secure_directory is not None:
@@ -326,7 +337,7 @@ class FileTransaction:
                 })
                 target = owned_path(self.root, name)
                 if name in self.manifest["files"]:
-                    source = owned_path(self.stage, name)
+                    source = owned_path(self.stage, self.stage_sources[name])
                     if digest(source) != self.manifest["files"][name]:
                         raise ValueError(f"Staged payload changed: {source}")
                     target.parent.mkdir(parents=True, exist_ok=True)

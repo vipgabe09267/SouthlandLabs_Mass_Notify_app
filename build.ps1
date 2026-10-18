@@ -39,6 +39,9 @@ Invoke-NativeChecked -Executable $PythonExecutable -Arguments @('-m', 'venv', '.
 $buildPython = Join-Path $ProjectRoot '.venv-build\Scripts\python.exe'
 Invoke-NativeChecked -Executable $buildPython -Arguments @('-m', 'pip', 'install', '--require-hashes', '--only-binary=:all:', '-r', 'requirements-build.txt')
 Invoke-NativeChecked -Executable $buildPython -Arguments @('-m', 'pip', 'check')
+Invoke-NativeChecked -Executable $buildPython -Arguments @('tools/prepare_tk_assets.py')
+$env:TCL_LIBRARY = Join-Path $ProjectRoot 'build\tk-data\tcl_library'
+$env:TK_LIBRARY = Join-Path $ProjectRoot 'build\tk-data\tk_library'
 Invoke-NativeChecked -Executable $buildPython -Arguments @('tools/prepare_piper_assets.py')
 Invoke-NativeChecked -Executable $buildPython -Arguments @('-m', 'unittest', 'discover', '-v')
 if (-not $Headless) {

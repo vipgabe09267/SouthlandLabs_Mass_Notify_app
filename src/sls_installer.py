@@ -720,7 +720,7 @@ class InstallerWindow:
         options.grid(row=0, column=0, columnspan=2, sticky="ew")
         options.columnconfigure(0, weight=1)
         ttk.Label(options, text="Install options", style="Section.TLabel").grid(row=0, column=0, columnspan=3, sticky="w")
-        ttk.Label(options, text="Setup closes this installation's app, including stuck background processes.", style="Hint.TLabel").grid(
+        ttk.Label(options, text="Setup closes this installation's app, including stuck background processes.", style="Hint.TLabel", wraplength=500).grid(
             row=1, column=0, columnspan=3, sticky="w", pady=(3, 12)
         )
         ttk.Label(options, text="Install folder", style="Hint.TLabel").grid(row=2, column=0, columnspan=3, sticky="w")
@@ -750,7 +750,7 @@ class InstallerWindow:
         )
         terms_box = Text(
             terms,
-            width=88,
+            width=1,
             height=6,
             wrap="word",
             state="normal",
@@ -781,8 +781,11 @@ class InstallerWindow:
         progress.columnconfigure(0, weight=1)
         self.progressbar = ttk.Progressbar(progress, mode="indeterminate")
         self.progressbar.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 8))
-        ttk.Label(progress, textvariable=self.status, style="Status.TLabel").grid(row=1, column=0, sticky="w")
-        self.log_box = Text(progress, width=88, height=5, state="disabled", wrap="word", font=("Consolas", 8))
+        self.status_label = ttk.Label(progress, textvariable=self.status, style="Status.TLabel", width=1, wraplength=500)
+        self.status_label.grid(row=1, column=0, columnspan=3, sticky="ew")
+        self.body.canvas.bind("<Configure>", lambda event: self.status_label.configure(
+            wraplength=max(160, event.width - 100)), add="+")
+        self.log_box = Text(progress, width=1, height=5, state="disabled", wrap="word", font=("Consolas", 8))
         self.log_box.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(6, 0))
         actions = ttk.Frame(self.root, padding=(16, 10), style="Page.TFrame")
         actions.grid(row=2, column=0, sticky="e")

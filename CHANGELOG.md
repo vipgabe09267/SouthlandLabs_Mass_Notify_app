@@ -2,6 +2,9 @@
 
 ## Unreleased - 1.0.14-beta
 
+- Fix upgrades rejecting unchanged Microsoft runtime DLLs when the new package changes filename capitalization. Preserve one manifest entry per Windows path, verify the previous hash, and retain rollback and interrupted-upgrade recovery.
+- Wrap installer status messages and let the terms/log panels fit the available width, so long error paths do not stretch setup horizontally.
+- Bundle Tcl/Tk initialization scripts explicitly. Verify setup can construct its hidden UI without relying on the build machine's library paths, including during headless validation.
 - Add offline Piper speech for announcements, enabled by default. Add a Settings toggle and eight bundled voices: Lessac low (default), Amy low, Lessac medium, Ryan low, French Siwis medium, German Thorsten low, Portuguese Faber medium, and Spanish Davefx medium.
 - Serialize announcement sounds and speech, stop dismissed or expired messages, and let higher-priority alerts interrupt audio. Keep synthesis off the UI thread in a hidden, time-limited process. Speech never submits a receipt, read confirmation, or safety response.
 - Pin the speech dependencies, voice model hashes, configurations, and attribution files. Check real synthesis with every packaged voice without opening a window or playing sound. Raise bounded installer/download size limits to accommodate the eight offline models; retain hash and exact-size verification.

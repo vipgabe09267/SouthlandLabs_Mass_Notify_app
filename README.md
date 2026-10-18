@@ -121,6 +121,10 @@ To build without opening any app or installer windows on the current desktop, ad
 
 If an upgrade is interrupted, rerun setup. It verifies the protected rollback journal, backup hashes, and destination files before restoring the previous application files. Opening setup and validating a path perform no recovery writes. Unsupported old journals or modified files require administrator review; setup retains their evidence.
 
+Upgrades recognize filename capitalization changes in bundled Windows runtime DLLs. Setup still verifies each installed file against its previous manifest hash before replacing it; a genuinely modified or unowned file is retained for review.
+
+Both app and setup include their Tcl/Tk script libraries. The package check constructs setup with its window withdrawn and clears build-time library paths to verify that its UI runtime is self-contained.
+
 ```text
 dist/
 ├── SLS_Mass_Notify_Installer.exe     # Distribute this installer

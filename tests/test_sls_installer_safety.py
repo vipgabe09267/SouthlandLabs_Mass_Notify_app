@@ -11,6 +11,70 @@ import sls_install_safety as safety
 
 
 class ManifestSafetyTests(unittest.TestCase):
+    def runtime_upgrade(self, directory):
+        root, stage = Path(directory) / "install", Path(directory) / "stage"
+        (root / "_internal").mkdir(parents=True)
+        (stage / "_internal").mkdir(parents=True)
+        installed, incoming = "_internal/VCRUNTIME140_1.dll", "_internal/vcruntime140_1.dll"
+        (root / installed).write_bytes(b"old verified runtime")
+        previous = safety.manifest_for(root, version="old")
+        safety.write_json(root / safety.MANIFEST_NAME, previous)
+        (stage / incoming).write_bytes(b"new verified runtime")
+        intended = safety.manifest_for(stage, version="new")
+        return root, stage, installed, incoming, previous, intended
+
+    def test_case_only_runtime_name_change_upgrades_one_owned_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root, stage, installed, incoming, previous, intended = self.runtime_upgrade(directory)
+            with safety.FileTransaction(root, stage, intended) as transaction:
+                self.assertEqual(transaction.changes, [installed])
+                self.assertEqual(transaction.stage_sources[installed], incoming)
+                self.assertEqual((root / installed).read_bytes(), b"new verified runtime")
+                transaction.commit()
+            saved = safety.read_manifest(root)
+            self.assertEqual(list(saved["files"]), [installed])
+            self.assertEqual(saved["files"][installed], safety.digest(root / installed))
+            self.assertFalse((root / safety.TRANSACTION_NAME).exists())
+
+    def test_case_only_name_change_keeps_rollback_hash_and_original_manifest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root, stage, installed, incoming, previous, intended = self.runtime_upgrade(directory)
+            with self.assertRaisesRegex(RuntimeError, "registration failed"):
+                with safety.FileTransaction(root, stage, intended):
+                    raise RuntimeError("registration failed")
+            self.assertEqual((root / installed).read_bytes(), b"old verified runtime")
+            self.assertEqual(safety.read_manifest(root), previous)
+
+    def test_case_only_name_change_can_recover_after_process_interruption(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root, stage, installed, incoming, previous, intended = self.runtime_upgrade(directory)
+            transaction = safety.FileTransaction(root, stage, intended)
+            transaction.__enter__()  # Simulate a process dying before commit/exit.
+            journal = json.loads((root / safety.TRANSACTION_NAME).read_text(encoding="utf-8"))
+            self.assertEqual(journal["changes"], [installed])
+            self.assertEqual(list(journal["next_manifest"]["files"]), [installed])
+            self.assertTrue(safety.recover_interrupted_upgrade(root))
+            self.assertEqual((root / installed).read_bytes(), b"old verified runtime")
+            self.assertEqual(safety.read_manifest(root), previous)
+
+    def test_case_only_name_change_still_refuses_a_modified_owned_runtime(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root, stage, installed, incoming, previous, intended = self.runtime_upgrade(directory)
+            (root / installed).write_bytes(b"unexpected modification")
+            with self.assertRaisesRegex(ValueError, "unowned or changed"):
+                with safety.FileTransaction(root, stage, intended):
+                    self.fail("Modified runtime must be rejected")
+            self.assertEqual((root / installed).read_bytes(), b"unexpected modification")
+            self.assertEqual(safety.read_manifest(root), previous)
+
+    def test_case_aliases_within_a_new_manifest_are_rejected_before_backup_creation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root, stage, installed, incoming, previous, intended = self.runtime_upgrade(directory)
+            intended["files"][installed] = intended["files"][incoming]
+            with self.assertRaisesRegex(ValueError, "duplicate or reserved"):
+                safety.FileTransaction(root, stage, intended)
+            self.assertFalse(list(Path(directory).glob(".sls-backup-*")))
+
     def test_path_validation_never_recovers_or_changes_an_interrupted_install(self):
         with tempfile.TemporaryDirectory() as directory:
             protected = Path(directory)

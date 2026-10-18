@@ -2,6 +2,7 @@
 import hashlib
 import json
 import marshal
+import os
 import ssl
 import sys
 import subprocess
@@ -95,12 +96,20 @@ def main():
         subprocess.run([str(application), "--check-presentation"], timeout=15,
                        creationflags=subprocess.CREATE_NO_WINDOW, check=True)
     installer = verify(ROOT / "build" / "installer-payload" / "SLS_Mass_Notify_Installer", "sls_installer")
+    for directory in (application.parent, installer.parent):
+        for relative in ("_internal/_tcl_data/init.tcl", "_internal/_tk_data/tk.tcl"):
+            if not (directory / relative).is_file():
+                raise SystemExit(f"Missing packaged UI runtime scripts: {directory / relative}")
     embedded = installer.parent / "_internal" / "SLS_Mass_Notify" / "SLS_Mass_Notify.exe"
     if digest(embedded) != digest(application):
         raise SystemExit("Installer contains a different application payload")
-    if not headless:
-        subprocess.run([str(installer), "--check-ui"], timeout=45,
-                       creationflags=subprocess.CREATE_NO_WINDOW, check=True)
+    # This check withdraws the setup window before constructing any widgets.
+    # Clear build-time paths so it must use its own packaged Tcl/Tk libraries.
+    ui_environment = os.environ.copy()
+    ui_environment.pop("TCL_LIBRARY", None)
+    ui_environment.pop("TK_LIBRARY", None)
+    subprocess.run([str(installer), "--check-ui"], timeout=45, env=ui_environment,
+                   creationflags=subprocess.CREATE_NO_WINDOW, check=True)
     bootstrap = distribution / "SLS_Mass_Notify_Installer.exe"
     report = subprocess.run([str(bootstrap), "--check-package"], capture_output=True, text=True,
                             timeout=30, creationflags=subprocess.CREATE_NO_WINDOW, check=True)
@@ -109,7 +118,7 @@ def main():
         raise SystemExit(f"Bootstrap embedded package verification failed: {report.stdout!r}")
     print(f"Verified app and self-contained installer: version {VERSION}, Python 3.14.7, {ssl.OPENSSL_VERSION}; inventories, source bytecode, identical app payload, and bootstrap package self-check.")
     if headless:
-        print("Headless validation: no app or installer UI was started. Desktop smoke checks remain outstanding.")
+        print("Headless validation: no windows were displayed. Setup construction was checked with its window withdrawn; interactive desktop smoke checks remain outstanding.")
 
 
 if __name__ == "__main__":
