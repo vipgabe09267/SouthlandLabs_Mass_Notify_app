@@ -1,6 +1,7 @@
 param(
     [switch]$Clean,
     [switch]$Release,
+    [switch]$Headless,
     [string]$PythonExecutable = '',
     [string]$SignTool = '',
     [string]$CertificateThumbprint = '',
@@ -11,7 +12,7 @@ param(
 $ProjectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 . (Join-Path $ProjectRoot 'build-common.ps1')
 Set-Location -LiteralPath $ProjectRoot
-$buildArgs = @{ Clean=$Clean; Release=$Release; PythonExecutable=$PythonExecutable; SignTool=$SignTool; CertificateThumbprint=$CertificateThumbprint; TrustedSignerSha256=$TrustedSignerSha256; TimestampUrl=$TimestampUrl }
+$buildArgs = @{ Clean=$Clean; Release=$Release; Headless=$Headless; PythonExecutable=$PythonExecutable; SignTool=$SignTool; CertificateThumbprint=$CertificateThumbprint; TrustedSignerSha256=$TrustedSignerSha256; TimestampUrl=$TimestampUrl }
 & (Join-Path $ProjectRoot 'build.ps1') @buildArgs
 $buildPython = Join-Path $ProjectRoot '.venv-build\Scripts\python.exe'
 $appDirectory = Join-Path $ProjectRoot 'dist\SLS_Mass_Notify'
@@ -31,8 +32,11 @@ if ($Release) {
 # Retire the old loose Python installer bundle; users launch the self-contained
 # bootstrap now. This helper checks the workspace boundary and reparse points.
 Remove-BuildDirectory -Root $ProjectRoot -Name 'dist\SLS_Mass_Notify_Installer'
-Invoke-NativeChecked -Executable $buildPython -Arguments @('tools/verify_build_artifacts.py')
-Invoke-NativeChecked -Executable $buildPython -Arguments @('tools/smoke_setup_runtime.py', '--full-payload')
+$verifyArgs = @('tools/verify_build_artifacts.py')
+if ($Headless) { $verifyArgs += '--headless' }
+Invoke-NativeChecked -Executable $buildPython -Arguments $verifyArgs
+Invoke-NativeChecked -Executable $buildPython -Arguments @('tools/smoke_setup_runtime.py', '--files-only')
+if (-not $Headless) { Invoke-NativeChecked -Executable $buildPython -Arguments @('tools/smoke_setup_runtime.py', '--full-payload') }
 $packageItems = @($bootstrap)
 $packageDirectory = Join-Path $ProjectRoot 'dist\packages'
 New-Item -ItemType Directory -Force -Path $packageDirectory | Out-Null

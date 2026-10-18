@@ -24,7 +24,7 @@ from pathlib import Path
 from packaging.version import InvalidVersion, Version
 
 DEFAULT_ASSETS = ("SLS_Mass_Notify_Installer.exe", "SLS_Mass_Notify_Installer.zip")
-MAX_DOWNLOAD_BYTES = 256 * 1024 * 1024
+MAX_DOWNLOAD_BYTES = 1024 * 1024 * 1024  # Bounded installer including eight offline voices.
 HTTP_HEADER_DEADLINE_SECONDS = 30
 DOWNLOAD_DEADLINE_SECONDS = 600
 CDN_HOSTS = frozenset({"release-assets.githubusercontent.com", "objects.githubusercontent.com"})

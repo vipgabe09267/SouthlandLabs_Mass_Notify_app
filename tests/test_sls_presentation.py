@@ -152,6 +152,19 @@ class PolicyTests(unittest.TestCase):
 
 
 class PresenterTests(unittest.TestCase):
+    def test_audio_worker_receives_displayed_records_and_cancels_only_dismissed_record(self):
+        self.presenter.audio_handler = Mock()
+        self.presenter.cancel_audio = Mock()
+        first = alert(kind="announcement", severity="notice")
+        second = alert(kind="announcement", severity="notice")
+        self.presenter.submit("one", first)
+        self.presenter.submit("two", second)
+        self.assertEqual([c.args[0] for c in self.presenter.audio_handler.call_args_list], ["one", "two"])
+        self.presenter._respond("one", "dismissed")
+        self.presenter.cancel_audio.assert_called_once_with("one")
+        self.acknowledged.assert_called_once_with("one", "dismissed")
+        self.assertIn("two", self.presenter.visible)
+
     def setUp(self):
         self.view_patch = patch.object(presentation, "_AlertView", FakeView)
         self.view_patch.start()

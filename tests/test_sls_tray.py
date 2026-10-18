@@ -54,6 +54,15 @@ class TrayPolicyTests(unittest.TestCase):
         tray._window_proc(123, 9876, 0, 0)
         tray._notify.assert_called_once_with(sls_tray.NIM_ADD)
 
+    def test_power_broadcast_delivers_only_suspend_and_resume_events(self):
+        event = Mock()
+        tray = sls_tray.TrayIcon(Mock(), Mock(), Mock(), Mock(), on_system_event=event)
+        for state in (sls_tray.PBT_APMSUSPEND, sls_tray.PBT_APMRESUMEAUTOMATIC,
+                      sls_tray.PBT_APMRESUMESUSPEND, 10):
+            self.assertEqual(tray._window_proc(123, sls_tray.WM_POWERBROADCAST, state, 0), 1)
+        self.assertEqual(event.call_args_list, [unittest.mock.call("suspend"),
+                                               unittest.mock.call("resume"), unittest.mock.call("resume")])
+
     def test_stop_before_start_is_safe(self):
         tray = sls_tray.TrayIcon(Mock(), Mock(), Mock(), Mock())
         self.assertTrue(tray.stop())

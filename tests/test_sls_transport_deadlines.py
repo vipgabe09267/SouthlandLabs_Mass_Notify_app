@@ -189,6 +189,41 @@ class TransportSafetyTests(unittest.TestCase):
         self.assertTrue(body.closed)
         self.assertEqual(caught.exception.retry_after, 7)
 
+    def test_capacity_body_on_poll_or_receipt_does_not_bypass_retry_after(self):
+        body = io.BytesIO(b'{"ok":false,"error":"stream_capacity_reached"}')
+        error = urllib.error.HTTPError("https://example.invalid", 429, "Limited", {"Retry-After": "300"}, body)
+        with self.assertRaises(client.RateLimitedError) as caught:
+            client.raise_http_status(error)
+        self.assertNotIsInstance(caught.exception, client.StreamCapacityError)
+        self.assertEqual(caught.exception.retry_after, 300)
+        self.assertTrue(body.closed)
+
+    def test_stream_error_body_deadline_unwraps_http_error_and_stops_trickling(self):
+        reader, _, response, trickle = self.sockets()
+        error = urllib.error.HTTPError("https://example.invalid", 429, "Limited", {"Retry-After": "7"}, response)
+        trickle(part=b" ", duration=0.8)
+        real_deadline = client.SocketDeadline
+        started = time.monotonic()
+        with mock.patch.object(client, "SocketDeadline", side_effect=lambda sock, _seconds, **kwargs: real_deadline(sock, 0.12, **kwargs)):
+            with self.assertRaises(client.RateLimitedError) as caught:
+                client.raise_http_status(error, stream_request=True)
+        self.assertLess(time.monotonic()-started, 0.6)
+        self.assertNotIsInstance(caught.exception, client.StreamCapacityError)
+        self.assertEqual(caught.exception.retry_after, 7)
+
+    def test_ambiguous_stream_error_body_preserves_normal_rate_limit(self):
+        for payload in (b'invalid', b'[]', b'{"ok":false,"error":"rate_limited"}',
+                        b'{"ok":true,"error":"stream_capacity_reached"}', b'x' * 4097,
+                        b'[' * 1500 + b']' * 1500):
+            with self.subTest(payload=payload[:60]):
+                body = io.BytesIO(payload)
+                error = urllib.error.HTTPError("https://example.invalid", 429, "Limited", {"Retry-After": "7"}, body)
+                with self.assertRaises(client.RateLimitedError) as caught:
+                    client.raise_http_status(error, stream_request=True)
+                self.assertNotIsInstance(caught.exception, client.StreamCapacityError)
+                self.assertEqual(caught.exception.retry_after, 7)
+                self.assertTrue(body.closed)
+
     def test_receipt_worker_never_fetches_retained_notifications(self):
         self.worker.authenticated_event.set()
         def receipts(*_args, **_kwargs):

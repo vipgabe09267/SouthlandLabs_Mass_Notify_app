@@ -192,10 +192,13 @@ class AlertPresenter:
                  on_failed: Callable[[str, str], Any], *,
                  play_sound: Callable[[Any], Any] | None = None,
                  stop_sound: Callable[[], Any] | None = None,
+                 audio_handler: Callable[..., Any] | None = None,
+                 cancel_audio: Callable[[str | None], Any] | None = None,
                  image_loader: Callable[[Any], bytes | None] | None = None,
                  on_state_changed: Callable[[], Any] | None = None,
                  can_display: Callable[[str], bool] | None = None,
                  on_discarded: Callable[[str], Any] | None = None,
+                 on_incident_response: Callable[[str], Any] | None = None,
                  max_pending: int = MAX_PENDING) -> None:
         self.root = root
         self.on_displayed = on_displayed
@@ -203,6 +206,8 @@ class AlertPresenter:
         self.on_failed = on_failed
         self.play_sound = play_sound
         self.stop_sound = stop_sound
+        self.audio_handler = audio_handler
+        self.cancel_audio = cancel_audio
         self.image_loader = image_loader
         self.on_state_changed = on_state_changed
         self.can_display = can_display
@@ -213,6 +218,8 @@ class AlertPresenter:
         self.history: deque[PendingAlert] = deque(maxlen=MAX_HISTORY)
         self._sequence = 0
         self._closed = False
+        self._critical_active = threading.Event()
+        self.on_incident_response = on_incident_response
         self._draining = False
         self._audio_priority: int | None = None
         self._audio_until = 0.0
@@ -224,7 +231,9 @@ class AlertPresenter:
 
     @property
     def has_active_critical(self) -> bool:
-        return any(view.item.policy.persistent for view in self.visible.values())
+        # The updater reads this from a worker thread. Only Tk may iterate or
+        # mutate the view collection; publish a thread-safe snapshot instead.
+        return self._critical_active.is_set()
 
     @property
     def pending_count(self) -> int:
@@ -295,6 +304,8 @@ class AlertPresenter:
             view.close()
         if self._audio_record == record_id:
             self._stop_audio()
+        if self.cancel_audio:
+            self.cancel_audio(record_id)
         if self.on_discarded:
             self.on_discarded(record_id)
         self._changed()
@@ -307,6 +318,10 @@ class AlertPresenter:
                 self.discard(record_id)
 
     def _changed(self) -> None:
+        if any(view.item.policy.persistent for view in self.visible.values()):
+            self._critical_active.set()
+        else:
+            self._critical_active.clear()
         if self.on_state_changed and not self._closed:
             self.root.after_idle(self.on_state_changed)
 
@@ -352,6 +367,8 @@ class AlertPresenter:
             view.close()
         if self._audio_record == record_id:
             self._stop_audio()
+        if self.cancel_audio:
+            self.cancel_audio(record_id)
         item.status = status
         self._remember(item)
         self._changed()
@@ -372,6 +389,13 @@ class AlertPresenter:
         self._audio_record = ""
 
     def _play_audio(self, item: PendingAlert, view: _AlertView) -> None:
+        if self.audio_handler:
+            expires = item.policy.expires.timestamp() if item.policy.expires else None
+            if item.policy.timeout_seconds:
+                local_expiry = time.time() + item.policy.timeout_seconds
+                expires = min(expires, local_expiry) if expires else local_expiry
+            self.audio_handler(item.record_id, item.alert, item.policy.priority, expires)
+            return
         if not self.play_sound:
             return
         now = time.monotonic()
@@ -419,6 +443,8 @@ class AlertPresenter:
                     self.pending[key] = view.item
                     view.close()
                 self._stop_audio()
+                if self.cancel_audio:
+                    self.cancel_audio(None)
                 ready = [candidate]
             elif critical:
                 return
@@ -443,6 +469,7 @@ class AlertPresenter:
                     # Durable inbox remains responsible for retry after failure.
         finally:
             self._draining = False
+            self._changed()
 
     def _tick(self) -> None:
         if self._closed:
@@ -492,6 +519,14 @@ class AlertPresenter:
         details = ScrolledText(frame, wrap="word", height=12, font="TkTextFont")
         details.pack(fill="both", expand=True, pady=(8, 0))
         ttk.Label(frame, text="Responses shown here are recorded on this device.").pack(anchor="w", pady=(8, 0))
+        response_button = None
+        if self.on_incident_response:
+            def respond_selected():
+                selection = rows.curselection()
+                if selection:
+                    self.on_incident_response(text(filtered[selection[0]].get("record_id")))
+            response_button = ttk.Button(frame, text="Respond to incident", command=respond_selected, state="disabled")
+            response_button.pack(anchor="w", pady=(8, 0))
         if records is None:
             items = list(self.history) + list(self.pending.values()) + [view.item for view in self.visible.values()]
             source = [{"record_id": item.record_id, "title": field(item.alert, "title"),
@@ -508,6 +543,8 @@ class AlertPresenter:
                 return
             item = filtered[selection[0]]
             payload = item.get("payload") if isinstance(item.get("payload"), Mapping) else item
+            if response_button is not None:
+                response_button.configure(state="normal" if payload.get("response_incident_id") and item.get("record_id") else "disabled")
             value = "\n\n".join(part for part in (
                 text(payload.get("title")), text(item.get("status") or item.get("state")),
                 text(payload.get("timestamp") or item.get("received_at")), text(payload.get("area")),
@@ -528,6 +565,8 @@ class AlertPresenter:
                 rows.selection_set(0)
                 select()
             else:
+                if response_button is not None:
+                    response_button.configure(state="disabled")
                 details.configure(state="normal")
                 details.delete("1.0", "end")
                 details.configure(state="disabled")
@@ -545,9 +584,12 @@ class AlertPresenter:
             except Exception:
                 LOG.debug("Presentation timer already stopped", exc_info=True)
         self._stop_audio()
+        if self.cancel_audio:
+            self.cancel_audio(None)
         for view in list(self.visible.values()):
             view.close()
         self.visible.clear()
+        self._critical_active.clear()
         self.pending.clear()
         if self._history_window is not None:
             try:
@@ -580,6 +622,10 @@ class _AlertView:
             # Reserve the footer before allocating any space to message content.
             footer = ttk.Frame(frame)
             footer.pack(side="bottom", fill="x")
+            if field(item.alert, "response_incident_id") and getattr(presenter, "on_incident_response", None):
+                ttk.Button(footer, text="Respond to incident",
+                           command=lambda: presenter.on_incident_response(item.record_id)).pack(
+                               side="bottom", anchor="w", pady=(8, 0))
             controls = ttk.Frame(footer)
             controls.pack(side="bottom", fill="x", pady=(12, 0))
             ttk.Button(controls, text="Details", command=self.show_details).pack(side="left")

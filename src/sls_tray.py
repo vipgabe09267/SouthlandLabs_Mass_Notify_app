@@ -14,6 +14,8 @@ import threading
 from typing import Callable
 import uuid
 
+from sls_system_events import AddressChangeSubscription
+
 
 LOG = logging.getLogger(__name__)
 WM_TRAY = 0x8001
@@ -21,6 +23,8 @@ WM_REFRESH = 0x8002
 WM_CLOSE = 0x0010
 WM_DESTROY = 0x0002
 WM_COMMAND = 0x0111
+WM_POWERBROADCAST = 0x0218
+PBT_APMSUSPEND, PBT_APMRESUMESUSPEND, PBT_APMRESUMEAUTOMATIC = 4, 7, 18
 WM_CONTEXTMENU = 0x007B
 WM_RBUTTONUP = 0x0205
 WM_LBUTTONDBLCLK = 0x0203
@@ -118,9 +122,12 @@ class _WinAPI:
 class TrayIcon:
     def __init__(self, on_open: Callable[[], None], on_history: Callable[[], None],
                  on_diagnostics: Callable[[], None], on_exit: Callable[[], None], *,
+                 on_system_event: Callable[[str], None] | None = None,
                  icon_path: str | os.PathLike[str] | None = None) -> None:
         self.callbacks = dict(open=on_open, history=on_history, diagnostics=on_diagnostics, exit=on_exit)
         self.icon_path = Path(icon_path).resolve() if icon_path else None
+        self.on_system_event = on_system_event
+        self._address_subscription = None
         self._status, self._detail = "offline", "Starting"
         self._lock = threading.Lock()
         self._ready = threading.Event()
@@ -237,6 +244,13 @@ class TrayIcon:
 
     def _window_proc(self, hwnd, message, wparam, lparam):
         try:
+            if message == WM_POWERBROADCAST:
+                if self.on_system_event:
+                    if wparam == PBT_APMSUSPEND:
+                        self.on_system_event("suspend")
+                    elif wparam in (PBT_APMRESUMESUSPEND, PBT_APMRESUMEAUTOMATIC):
+                        self.on_system_event("resume")
+                return 1
             if message == WM_TRAY:
                 action = callback_action(lparam)
                 if action == "menu":
@@ -290,6 +304,12 @@ class TrayIcon:
                 raise ctypes.WinError(ctypes.get_last_error())
             with self._lock:
                 self._hwnd = hwnd
+            if self.on_system_event:
+                self._address_subscription = AddressChangeSubscription(self.on_system_event)
+                try:
+                    self._address_subscription.start()
+                except OSError:
+                    LOG.warning("Native address notifications unavailable; timed reconnect remains active", exc_info=True)
             for status, resource in (("healthy", 32516), ("degraded", 32515), ("offline", 32513)):
                 icon = api.user32.LoadIconW(None, ctypes.c_void_p(resource))
                 if not icon:
@@ -318,6 +338,11 @@ class TrayIcon:
             self.error = str(exc)
             LOG.exception("Tray indicator is unavailable")
         finally:
+            if self._address_subscription is not None:
+                try:
+                    self._address_subscription.close()
+                except OSError:
+                    LOG.exception("Unable to unregister network notifications")
             api = self._api
             if api is not None:
                 self._notify(NIM_DELETE)

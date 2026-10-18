@@ -77,20 +77,22 @@ static class SetupBootstrap
         ProtectedDirectory(path);
     }
 
-    static MemoryStream Payload()
+    static Stream Payload()
     {
-        MemoryStream bytes = new MemoryStream();
-        using (Stream resource = Assembly.GetExecutingAssembly().GetManifestResourceStream("setup-payload.zip")) {
-            if (resource == null) throw new InvalidDataException("The installer payload is missing.");
-            resource.CopyTo(bytes);
+        Stream resource = Assembly.GetExecutingAssembly().GetManifestResourceStream("setup-payload.zip");
+        if (resource == null) throw new InvalidDataException("The installer payload is missing.");
+        try {
+            if (!resource.CanSeek) throw new InvalidDataException("The installer payload cannot be verified.");
+            string hash;
+            using (SHA256 sha = SHA256.Create())
+                hash = BitConverter.ToString(sha.ComputeHash(resource)).Replace("-", "").ToLowerInvariant();
+            if (hash != BuildInfo.PayloadSha256) throw new InvalidDataException("The installer payload is damaged. Download it again.");
+            resource.Position = 0;
+            return resource;
+        } catch {
+            resource.Dispose();
+            throw;
         }
-        bytes.Position = 0;
-        string hash;
-        using (SHA256 sha = SHA256.Create())
-            hash = BitConverter.ToString(sha.ComputeHash(bytes)).Replace("-", "").ToLowerInvariant();
-        if (hash != BuildInfo.PayloadSha256) throw new InvalidDataException("The installer payload is damaged. Download it again.");
-        bytes.Position = 0;
-        return bytes;
     }
 
     static void Unpack(Stream stream, string destination)
@@ -108,7 +110,7 @@ static class SetupBootstrap
                     if (part.Length == 0 || part == "." || part == ".." || part.EndsWith(" ") || part.EndsWith("."))
                         throw new InvalidDataException("Invalid setup payload path.");
                 total = checked(total + entry.Length);
-                if (entry.Length > 256 * 1024 * 1024 || total > 512 * 1024 * 1024)
+                if (entry.Length > 256 * 1024 * 1024 || total > 1024L * 1024 * 1024)
                     throw new InvalidDataException("Setup payload exceeds its size limit.");
                 if (root != null) {
                     string target = Path.GetFullPath(Path.Combine(root, name.Replace('/', Path.DirectorySeparatorChar)));
@@ -146,7 +148,7 @@ static class SetupBootstrap
         try {
             // Build verification is deliberately non-elevating and never installs.
             if (args.Length == 1 && args[0] == "--check-package") {
-                using (MemoryStream payload = Payload()) Unpack(payload, null);
+                using (Stream payload = Payload()) Unpack(payload, null);
                 Console.WriteLine("SLS_PACKAGE_OK " + BuildInfo.Version + " " + BuildInfo.PayloadSha256 + " " + BuildInfo.SourceSha256);
                 return 0;
             }
@@ -170,7 +172,7 @@ static class SetupBootstrap
             string stage = Path.Combine(parent, ".sls-setup-" + Guid.NewGuid().ToString("N"));
             CreateProtected(stage);
             try {
-                using (MemoryStream payload = Payload()) Unpack(payload, stage);
+                using (Stream payload = Payload()) Unpack(payload, stage);
                 using (Process setup = Process.Start(new ProcessStartInfo {
                     FileName = Path.Combine(stage, SetupName),
                     Arguments = String.Join(" ", Array.ConvertAll(args, Quote)),

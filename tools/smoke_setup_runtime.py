@@ -12,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import json
 import tkinter as tk
 from unittest import mock
 
@@ -101,7 +102,7 @@ def main():
                 for name in ("require_admin", "verify_protected_directory", "protect_new_directory", "write_uninstall_registry", "restore_uninstall_registry"):
                     patches.enter_context(mock.patch.object(installer, name))
                 patches.enter_context(mock.patch.object(installer, "registered_install_dir", return_value=target))
-                patches.enter_context(mock.patch.object(installer, "validate_install_dir", side_effect=lambda path: path))
+                patches.enter_context(mock.patch.object(installer, "validate_install_dir", side_effect=lambda path, **_: path))
                 patches.enter_context(mock.patch.object(installer, "snapshot_uninstall_registry", return_value=None))
                 patches.enter_context(mock.patch.object(installer, "machine_shortcuts", return_value=shortcuts))
                 patches.enter_context(mock.patch.object(installer, "stage_payload", side_effect=stage))
@@ -165,5 +166,59 @@ def main():
                     process.wait(timeout=5)
 
 
+def check_file_upgrade():
+    """Exercise the complete large payload in a fixture, with no UI or OS writes."""
+    package = ROOT / "build" / "installer-payload" / "SLS_Mass_Notify_Installer"
+    with tempfile.TemporaryDirectory(prefix="sls-file-upgrade-", dir=ROOT / "build") as directory:
+        base = Path(directory).resolve()
+        assert base.is_relative_to((ROOT / "build").resolve())
+        target = base / "installed"
+        links = {key: base / (key + ".lnk") for key in ("application", "uninstall", "startup")}
+        transactions, phases = [], []
+        transaction_class = safety.FileTransaction
+        def transaction(*args, **kwargs):
+            result = transaction_class(*args, **kwargs)
+            transactions.append(result)
+            return result
+        with ExitStack() as patches:
+            patches.enter_context(mock.patch.object(installer.sys, "frozen", True, create=True))
+            patches.enter_context(mock.patch.object(installer.sys, "executable", str(package / "SLS_Mass_Notify_Installer.exe")))
+            patches.enter_context(mock.patch.object(installer.sys, "_MEIPASS", str(package / "_internal"), create=True))
+            installer.stage_payload(target)
+            with (target / installer.EXE_NAME).open("ab") as output:
+                output.write(b"fixture previous application")
+            safety.write_json(target / installer.DEFAULTS_NAME, {"startup_enabled": True, "auto_update_enabled": False})
+            safety.write_json(target / safety.MANIFEST_NAME, safety.manifest_for(target, version="fixture-previous"))
+            (target / "customer-notes.txt").write_text("preserve", encoding="utf-8")
+            models = {path.relative_to(target).as_posix(): path.stat().st_ino
+                      for path in (target / "_internal" / "tts").glob("*.onnx")}
+            assert len(models) == 8
+            for name in ("require_admin", "verify_protected_directory", "protect_new_directory",
+                         "create_protected_directories", "write_uninstall_registry", "restore_uninstall_registry", "stop_running_app"):
+                patches.enter_context(mock.patch.object(installer, name))
+            patches.enter_context(mock.patch.object(installer, "validate_install_dir", side_effect=lambda path, **_: path))
+            patches.enter_context(mock.patch.object(installer, "snapshot_uninstall_registry", return_value=None))
+            patches.enter_context(mock.patch.object(installer, "machine_shortcuts", return_value=links))
+            patches.enter_context(mock.patch.object(installer, "create_shortcut", side_effect=lambda path, dest, **_: path.write_text(str(dest), encoding="utf-8")))
+            patches.enter_context(mock.patch.object(installer, "FileTransaction", side_effect=transaction))
+            started = time.perf_counter()
+            installer.install_app(target, startup=None, auto_update=None, launch=False, remove_legacy=False,
+                                  progress=lambda message: phases.append((message, round(time.perf_counter() - started, 3))))
+            elapsed = round(time.perf_counter() - started, 3)
+        manifest = safety.read_manifest(target)
+        assert manifest["version"] == installer.APP_VERSION
+        assert transactions[0].changes == [installer.EXE_NAME], transactions[0].changes
+        assert all((target / name).stat().st_ino == identity for name, identity in models.items())
+        assert all(safety.digest(target / name) == expected for name, expected in manifest["files"].items())
+        assert (target / "customer-notes.txt").read_text(encoding="utf-8") == "preserve"
+        assert not (target / safety.TRANSACTION_NAME).exists()
+        print(json.dumps({"file_upgrade_seconds": elapsed, "owned_files_verified": len(manifest["files"]),
+                          "models_kept_in_place": len(models), "files_replaced": len(transactions[0].changes),
+                          "phases": phases, "scope": "Temporary fixture only; no UI, registry, production processes or Program Files writes"}), flush=True)
+
+
 if __name__ == "__main__":
-    main()
+    if "--files-only" in sys.argv:
+        check_file_upgrade()
+    else:
+        main()
