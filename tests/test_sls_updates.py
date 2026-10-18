@@ -25,6 +25,13 @@ def release(tag="v1.2.0", *, prerelease=False, digest=None, size=3, asset_name="
 
 
 class VersionTests(unittest.TestCase):
+    def test_voice_installer_size_is_supported_but_still_bounded(self):
+        large = release(size=550 * 1024 * 1024, asset_name="SLS_Mass_Notify_Installer.exe")
+        picked = updates.select_release([large], "1.0.0", owner=OWNER, repo=REPO)
+        self.assertEqual(picked["asset_size"], 550 * 1024 * 1024)
+        excessive = release(size=updates.MAX_DOWNLOAD_BYTES + 1)
+        self.assertIsNone(updates.select_release([excessive], "1.0.0", owner=OWNER, repo=REPO))
+
     def test_exe_only_release_and_preference_over_zip(self):
         exe = release(asset_name="SLS_Mass_Notify_Installer.exe")
         picked = updates.select_release([exe], "1.0.0", owner=OWNER, repo=REPO)

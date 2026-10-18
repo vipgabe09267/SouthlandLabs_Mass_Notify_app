@@ -12,6 +12,7 @@ from pathlib import Path
 import sqlite3
 import tempfile
 import threading
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -52,6 +53,8 @@ class IsolatedClientTest(unittest.TestCase):
         self.profile = client.normalize_endpoint(dict(endpoint="https://pbx.example.test", username="desktop-1",
                                                        password="old password", enabled=True), 0)
         self.instance = client.MassNotifyApp.__new__(client.MassNotifyApp)
+        self.instance.notification_audio = mock.Mock()
+        self.instance.voice_downloads = mock.Mock()
         instance = self.instance
         instance.config = client.normalize_config({"enabled": True, "endpoints": [self.profile]})
         instance.config_lock = threading.RLock()
@@ -81,6 +84,34 @@ class IsolatedClientTest(unittest.TestCase):
         worker = client.EndpointTransportWorker(self.instance, 0, self.instance.config["endpoints"][0])
         self.instance.workers[0] = worker
         return worker
+
+
+class UpdateSchedulingTests(IsolatedClientTest):
+    def real_presenter(self, *, critical=False):
+        # Use the production property rather than a callable Mock: a Mock hid
+        # a regression that attempted to call this boolean as a function.
+        self.instance.presenter = client.AlertPresenter(mock.Mock(), mock.Mock(), mock.Mock(), mock.Mock())
+        if critical:
+            self.instance.presenter.visible["critical"] = SimpleNamespace(
+                item=SimpleNamespace(policy=SimpleNamespace(persistent=True)))
+            self.instance.presenter._changed()
+
+    def test_enabled_update_check_runs_when_no_critical_alert_is_active(self):
+        self.instance.config["auto_update_enabled"] = True
+        self.real_presenter()
+        with mock.patch.object(client, "fetch_latest_github_release", return_value=None) as fetch, \
+             mock.patch.object(client.sls_updates, "cleanup_downloads"), \
+             mock.patch.object(client, "save_config"):
+            self.instance.check_for_updates_if_due()
+        fetch.assert_called_once_with("stable")
+        self.assertFalse(self.instance.presenter.has_active_critical)
+
+    def test_update_check_defers_while_critical_alert_is_active(self):
+        self.instance.config["auto_update_enabled"] = True
+        self.real_presenter(critical=True)
+        with mock.patch.object(client, "fetch_latest_github_release") as fetch:
+            self.instance.check_for_updates_if_due()
+        fetch.assert_not_called()
 
 
 class DurableDeliveryIntegrationTests(IsolatedClientTest):
@@ -279,6 +310,7 @@ class ConfigurationIntegrationTests(IsolatedClientTest):
 
     def test_nonboolean_settings_are_rejected_without_truthiness_conversion(self):
         corrupt = ({"enabled": "false"}, {"startup_enabled": 0}, {"auto_update_enabled": "true"},
+                   {"announcement_tts_enabled": "false"},
                    {"endpoints": [{"enabled": "false"}]},
                    {"endpoints": [{"reconnect_automatically": 1}]})
         for data in corrupt:

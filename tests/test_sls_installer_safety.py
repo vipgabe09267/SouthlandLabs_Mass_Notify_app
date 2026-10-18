@@ -11,6 +11,159 @@ import sls_install_safety as safety
 
 
 class ManifestSafetyTests(unittest.TestCase):
+    def test_verified_identical_files_are_not_backed_up_or_replaced(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root, stage = Path(directory) / "install", Path(directory) / "stage"
+            root.mkdir(); stage.mkdir()
+            for name in ("model.onnx", "app.exe"):
+                (root / name).write_bytes(b"unchanged")
+                (stage / name).write_bytes(b"unchanged")
+            safety.write_json(root / safety.MANIFEST_NAME, safety.manifest_for(root, version="old"))
+            with mock.patch.object(safety.shutil, "copy2", wraps=safety.shutil.copy2) as copy:
+                with safety.FileTransaction(root, stage, safety.manifest_for(stage, version="new")) as transaction:
+                    self.assertEqual(transaction.changes, [])
+                    copy.assert_not_called()
+                    transaction.commit()
+            self.assertEqual(safety.read_manifest(root)["version"], "new")
+            self.assertTrue((stage / "model.onnx").exists())
+
+    def test_complete_change_plan_is_journaled_once_before_any_replacement(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root, stage = Path(directory) / "install", Path(directory) / "stage"
+            root.mkdir(); stage.mkdir()
+            for name in ("a.dll", "b.dll", "c.dll"):
+                (root / name).write_bytes(b"old")
+                (stage / name).write_bytes(b"new")
+            safety.write_json(root / safety.MANIFEST_NAME, safety.manifest_for(root, version="old"))
+            with mock.patch.object(safety, "write_json", wraps=safety.write_json) as write:
+                with safety.FileTransaction(root, stage, safety.manifest_for(stage, version="new")) as transaction:
+                    journals = [call for call in write.call_args_list if Path(call.args[0]).name == safety.TRANSACTION_NAME]
+                    self.assertEqual(len(journals), 1)
+                    self.assertEqual(journals[0].args[1]["changes"], ["a.dll", "b.dll", "c.dll"])
+                    transaction.commit()
+
+    def test_full_plan_recovery_restores_files_not_yet_replaced_at_interruption(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root, stage = Path(directory) / "install", Path(directory) / "stage"
+            root.mkdir(); stage.mkdir()
+            for name in ("a.dll", "b.dll", "c.dll"):
+                (root / name).write_bytes(b"old")
+                (stage / name).write_bytes(b"new")
+            previous = safety.manifest_for(root, version="old")
+            safety.write_json(root / safety.MANIFEST_NAME, previous)
+            transaction = safety.FileTransaction(root, stage, safety.manifest_for(stage, version="new"))
+            replace = safety.os.replace
+            class ProcessInterruption(BaseException):
+                pass
+            def interrupt_second(source, destination):
+                if Path(source) == stage / "b.dll":
+                    raise ProcessInterruption()
+                return replace(source, destination)
+            with mock.patch.object(safety.os, "replace", side_effect=interrupt_second), \
+                 mock.patch.object(transaction, "rollback"), self.assertRaises(ProcessInterruption):
+                transaction.__enter__()
+            self.assertEqual((root / "a.dll").read_bytes(), b"new")
+            self.assertEqual((root / "c.dll").read_bytes(), b"old")
+            self.assertTrue(safety.recover_interrupted_upgrade(root))
+            self.assertEqual(safety.read_manifest(root), previous)
+            self.assertTrue(all((root / name).read_bytes() == b"old" for name in previous["files"]))
+
+    def test_missing_owned_file_can_be_repaired_and_recovery_restores_its_absence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root, stage = Path(directory) / "install", Path(directory) / "stage"
+            root.mkdir(); stage.mkdir()
+            (root / "app.exe").write_bytes(b"old")
+            previous = safety.manifest_for(root, version="old")
+            safety.write_json(root / safety.MANIFEST_NAME, previous)
+            (root / "app.exe").unlink()
+            (stage / "app.exe").write_bytes(b"repaired")
+            transaction = safety.FileTransaction(root, stage, safety.manifest_for(stage, version="new"))
+            transaction.__enter__()
+            self.assertEqual((root / "app.exe").read_bytes(), b"repaired")
+            self.assertTrue(safety.recover_interrupted_upgrade(root))
+            self.assertFalse((root / "app.exe").exists())
+            self.assertEqual(safety.read_manifest(root), previous)
+
+    def runtime_upgrade(self, directory):
+        root, stage = Path(directory) / "install", Path(directory) / "stage"
+        (root / "_internal").mkdir(parents=True)
+        (stage / "_internal").mkdir(parents=True)
+        installed, incoming = "_internal/VCRUNTIME140_1.dll", "_internal/vcruntime140_1.dll"
+        (root / installed).write_bytes(b"old verified runtime")
+        previous = safety.manifest_for(root, version="old")
+        safety.write_json(root / safety.MANIFEST_NAME, previous)
+        (stage / incoming).write_bytes(b"new verified runtime")
+        intended = safety.manifest_for(stage, version="new")
+        return root, stage, installed, incoming, previous, intended
+
+    def test_case_only_runtime_name_change_upgrades_one_owned_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root, stage, installed, incoming, previous, intended = self.runtime_upgrade(directory)
+            with safety.FileTransaction(root, stage, intended) as transaction:
+                self.assertEqual(transaction.changes, [installed])
+                self.assertEqual(transaction.stage_sources[installed], incoming)
+                self.assertEqual((root / installed).read_bytes(), b"new verified runtime")
+                transaction.commit()
+            saved = safety.read_manifest(root)
+            self.assertEqual(list(saved["files"]), [installed])
+            self.assertEqual(saved["files"][installed], safety.digest(root / installed))
+            self.assertFalse((root / safety.TRANSACTION_NAME).exists())
+
+    def test_case_only_name_change_keeps_rollback_hash_and_original_manifest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root, stage, installed, incoming, previous, intended = self.runtime_upgrade(directory)
+            with self.assertRaisesRegex(RuntimeError, "registration failed"):
+                with safety.FileTransaction(root, stage, intended):
+                    raise RuntimeError("registration failed")
+            self.assertEqual((root / installed).read_bytes(), b"old verified runtime")
+            self.assertEqual(safety.read_manifest(root), previous)
+
+    def test_case_only_name_change_can_recover_after_process_interruption(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root, stage, installed, incoming, previous, intended = self.runtime_upgrade(directory)
+            transaction = safety.FileTransaction(root, stage, intended)
+            transaction.__enter__()  # Simulate a process dying before commit/exit.
+            journal = json.loads((root / safety.TRANSACTION_NAME).read_text(encoding="utf-8"))
+            self.assertEqual(journal["changes"], [installed])
+            self.assertEqual(list(journal["next_manifest"]["files"]), [installed])
+            self.assertTrue(safety.recover_interrupted_upgrade(root))
+            self.assertEqual((root / installed).read_bytes(), b"old verified runtime")
+            self.assertEqual(safety.read_manifest(root), previous)
+
+    def test_case_only_name_change_still_refuses_a_modified_owned_runtime(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root, stage, installed, incoming, previous, intended = self.runtime_upgrade(directory)
+            (root / installed).write_bytes(b"unexpected modification")
+            with self.assertRaisesRegex(ValueError, "unowned or changed"):
+                with safety.FileTransaction(root, stage, intended):
+                    self.fail("Modified runtime must be rejected")
+            self.assertEqual((root / installed).read_bytes(), b"unexpected modification")
+            self.assertEqual(safety.read_manifest(root), previous)
+
+    def test_case_aliases_within_a_new_manifest_are_rejected_before_backup_creation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root, stage, installed, incoming, previous, intended = self.runtime_upgrade(directory)
+            intended["files"][installed] = intended["files"][incoming]
+            with self.assertRaisesRegex(ValueError, "duplicate or reserved"):
+                safety.FileTransaction(root, stage, intended)
+            self.assertFalse(list(Path(directory).glob(".sls-backup-*")))
+
+    def test_path_validation_never_recovers_or_changes_an_interrupted_install(self):
+        with tempfile.TemporaryDirectory() as directory:
+            protected = Path(directory)
+            target = protected / "SLS"
+            target.mkdir()
+            journal = target / safety.TRANSACTION_NAME
+            journal.write_text("journal retained", encoding="utf-8")
+            with mock.patch.object(installer, "program_files_directory", return_value=protected), \
+                 mock.patch.object(installer, "verify_protected_directory"), \
+                 mock.patch.object(installer, "recover_interrupted_upgrade") as recover:
+                with self.assertRaises(RuntimeError):
+                    installer.validate_install_dir(target)
+                self.assertEqual(installer.validate_install_dir(target, allow_interrupted=True), target.resolve())
+            recover.assert_not_called()
+            self.assertEqual(journal.read_text(encoding="utf-8"), "journal retained")
+
     def test_manifest_rejects_traversal_and_windows_alternate_streams(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -131,6 +284,92 @@ class ManifestSafetyTests(unittest.TestCase):
                 with safety.FileTransaction(root, stage, safety.manifest_for(stage, version="2")):
                     pass
             self.assertEqual((root / safety.TRANSACTION_NAME).read_text(), "existing journal")
+
+    def test_verified_interrupted_upgrade_is_rolled_back(self):
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory)
+            root, backup = parent / "install", parent / ".sls-backup-fixture"
+            root.mkdir()
+            backup.mkdir()
+            (backup / "app.exe").write_bytes(b"old")
+            (root / "app.exe").write_bytes(b"new")
+            (root / "new.dll").write_bytes(b"new dependency")
+            previous = {
+                "schema": 1, "product": safety.PRODUCT_ID, "version": "1",
+                "files": {"app.exe": safety.digest(backup / "app.exe")}, "shortcuts": {},
+            }
+            intended = safety.manifest_for(root, version="2")
+            safety.write_json(root / safety.TRANSACTION_NAME, {
+                "schema": 1, "product": safety.PRODUCT_ID, "backup": str(backup),
+                "changes": ["app.exe", "new.dll"], "previous_manifest": previous,
+                "next_manifest": intended,
+            })
+            self.assertTrue(safety.recover_interrupted_upgrade(root))
+            self.assertEqual((root / "app.exe").read_bytes(), b"old")
+            self.assertFalse((root / "new.dll").exists())
+            self.assertEqual(safety.read_manifest(root), previous)
+            self.assertFalse(backup.exists())
+
+    def test_interrupted_upgrade_recovery_refuses_changed_destination(self):
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory)
+            root, backup = parent / "install", parent / ".sls-backup-fixture"
+            root.mkdir()
+            backup.mkdir()
+            (backup / "app.exe").write_bytes(b"old")
+            (root / "app.exe").write_bytes(b"tampered")
+            previous = {
+                "schema": 1, "product": safety.PRODUCT_ID, "version": "1",
+                "files": {"app.exe": safety.digest(backup / "app.exe")}, "shortcuts": {},
+            }
+            intended = {**previous, "version": "2", "files": {"app.exe": "0" * 64}}
+            safety.write_json(root / safety.TRANSACTION_NAME, {
+                "schema": 1, "product": safety.PRODUCT_ID, "backup": str(backup),
+                "changes": ["app.exe"], "previous_manifest": previous,
+                "next_manifest": intended,
+            })
+            with self.assertRaisesRegex(ValueError, "changed after interruption"):
+                safety.recover_interrupted_upgrade(root)
+            self.assertEqual((root / "app.exe").read_bytes(), b"tampered")
+            self.assertTrue((root / safety.TRANSACTION_NAME).exists())
+
+    def test_interrupted_recovery_can_resume_without_consuming_backup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory)
+            root, backup = parent / "install", parent / ".sls-backup-fixture"
+            root.mkdir()
+            backup.mkdir()
+            for name in ("a.exe", "b.dll"):
+                (backup / name).write_bytes(b"old-" + name.encode())
+                (root / name).write_bytes(b"new-" + name.encode())
+            previous = {
+                "schema": 1, "product": safety.PRODUCT_ID, "version": "1", "shortcuts": {},
+                "files": {name: safety.digest(backup / name) for name in ("a.exe", "b.dll")},
+            }
+            intended = safety.manifest_for(root, version="2")
+            safety.write_json(root / safety.TRANSACTION_NAME, {
+                "schema": 1, "product": safety.PRODUCT_ID, "backup": str(backup),
+                "changes": ["a.exe", "b.dll"], "previous_manifest": previous,
+                "next_manifest": intended,
+            })
+            real_replace = safety.os.replace
+            replacements = 0
+
+            def interrupt_second_restore(source, destination):
+                nonlocal replacements
+                if Path(source).name.startswith(".sls-restore-"):
+                    replacements += 1
+                    if replacements == 2:
+                        raise PermissionError("simulated second restore interruption")
+                return real_replace(source, destination)
+
+            with mock.patch.object(safety.os, "replace", side_effect=interrupt_second_restore), \
+                 self.assertRaises(PermissionError):
+                safety.recover_interrupted_upgrade(root)
+            self.assertTrue(backup.exists())
+            self.assertTrue(safety.recover_interrupted_upgrade(root))
+            for name in ("a.exe", "b.dll"):
+                self.assertEqual((root / name).read_bytes(), b"old-" + name.encode())
 
 
 class InstallerFlowTests(unittest.TestCase):

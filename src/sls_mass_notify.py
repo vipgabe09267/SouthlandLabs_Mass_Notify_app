@@ -39,7 +39,11 @@ from sls_version import VERSION
 import sls_ipc
 import sls_updates
 from sls_audio import inspect_wav, copy_validated_audio
+from sls_speech import NotificationAudio, DEFAULT_VOICE, VOICES, safe_voice
+from sls_voices import VoiceDownloads, voice_available
 from sls_tray import TrayIcon
+from sls_system_events import RecoverySignals
+from sls_incidents import IncidentClient, IncidentResponseWindow, response_incident
 
 try:
     from PIL import Image, ImageTk
@@ -79,6 +83,7 @@ SSE_MAX_EVENT_BYTES = 512 * 1024
 RECENT_EVENT_ID_LIMIT = 100
 RECONNECT_BACKOFF_SECONDS = (1, 2, 5, 10, 20, 30)
 FAULT_NOTIFY_SECONDS = 5 * 60
+NETWORK_RECOVERY_SECONDS = 90
 FAULT_TOAST_VISIBLE_MS = 18000
 IMAGE_FETCH_LIMIT_BYTES = 5 * 1024 * 1024
 UPDATE_CHECK_SECONDS = 15 * 60
@@ -143,7 +148,7 @@ LATEST_OBJECT_KEYS = {
 
 
 def resource_path(name: str) -> Path:
-    base = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+    base = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent.parent / "assets"))
     bundled = base / name
     if bundled.exists():
         return bundled
@@ -456,6 +461,7 @@ def normalize_config(config: dict) -> dict:
     normalized["last_event_id"] = first.get("last_event_id", "")
     normalized["last_fingerprint"] = first.get("last_fingerprint", "")
     normalized["audio_sound"] = safe_audio_name(safe_string(normalized.get("audio_sound")) or DEFAULT_AUDIO_NAME)
+    normalized["announcement_tts_voice"] = safe_voice(normalized.get("announcement_tts_voice"))
     for legacy_key in ("token", "no_token", "poll_seconds"):
         normalized.pop(legacy_key, None)
     return normalized
@@ -637,6 +643,8 @@ def default_config() -> dict:
         "trusted_signers": [],
         "retention_days": 30,
         "audio_sound": DEFAULT_AUDIO_NAME,
+        "announcement_tts_enabled": True,
+        "announcement_tts_voice": DEFAULT_VOICE,
         "endpoint": "",
         "enabled": True,
         "endpoints": [blank_endpoint(index) for index in range(MAX_ENDPOINTS)],
@@ -671,7 +679,7 @@ def load_config() -> dict:
     version = loaded.get("schema_version", 1)
     if type(version) is not int or version not in {1, 2}:
         raise ValueError("Settings use an unsupported schema version; refusing to overwrite them.")
-    for key in ("enabled", "startup_enabled", "auto_update_enabled"):
+    for key in ("enabled", "startup_enabled", "auto_update_enabled", "announcement_tts_enabled"):
         if key in loaded and type(loaded[key]) is not bool:
             raise ValueError(f"Saved {key} must be true or false.")
     if "endpoints" in loaded:
@@ -911,6 +919,7 @@ class AlertData:
     display_expires_at: str = ""
     created_at: str = ""
     delivery_expires_at: str = ""
+    response_incident_id: str = ""
 
 
 def safe_hex_color(value: object) -> str:
@@ -1061,6 +1070,7 @@ def extract_alert(data: object, raw_text: str) -> AlertData:
         display_timeout_seconds=source.get("display_timeout_seconds") if isinstance(source, dict) else None,
         display_expires_at=safe_string(source.get("display_expires_at", "")) if isinstance(source, dict) else "",
         created_at=safe_string(source.get("created_at", "")) if isinstance(source, dict) else "",
+        response_incident_id=response_incident(source),
     )
 
 
@@ -1080,6 +1090,10 @@ class RateLimitedError(ApiError):
     def __init__(self, message: str, retry_after: float = 60):
         super().__init__(message)
         self.retry_after = min(3600.0, max(1.0, retry_after))
+
+
+class StreamCapacityError(RateLimitedError):
+    """Only the SSE worker pool is full; normal desktop polling is permitted."""
 
 
 class ServiceUnavailableError(ApiError):
@@ -1233,10 +1247,25 @@ def open_http_request(
     return opener.open(request, timeout=timeout)
 
 
-def raise_http_status(exc: urllib.error.HTTPError) -> None:
-    # Error bodies are not used. Close their connection before translating the
-    # status, including rate-limit responses that will not be retried immediately.
-    exc.close()
+def raise_http_status(exc: urllib.error.HTTPError, *, stream_request: bool = False) -> None:
+    stream_capacity = False
+    try:
+        if stream_request and exc.code == 429:
+            # The PBX distinguishes streaming-worker capacity from normal API
+            # throttling. Inspect only this bounded body on the SSE endpoint;
+            # other routes must continue to honor their Retry-After delay.
+            try:
+                error_socket = response_socket(exc) or response_socket(getattr(exc, "fp", None))
+                with SocketDeadline(error_socket, 2, message="Stream error response exceeded its deadline"):
+                    body = exc.read(4097)
+                if len(body) <= 4096:
+                    details = json.loads(body.decode("utf-8"))
+                    stream_capacity = (isinstance(details, dict) and details.get("ok") is False
+                                       and details.get("error") == "stream_capacity_reached")
+            except (OSError, ValueError, TypeError, RecursionError):
+                pass  # Ambiguous failures retain the normal rate-limit delay.
+    finally:
+        exc.close()
     if exc.code == 401:
         raise UnauthorizedError("Authentication failed. Review the desktop username and password.") from exc
     if exc.code == 426:
@@ -1246,6 +1275,8 @@ def raise_http_status(exc: urllib.error.HTTPError) -> None:
             delay = float(exc.headers.get("Retry-After", "60"))
         except (ValueError, TypeError):
             delay = 60
+        if stream_capacity:
+            raise StreamCapacityError("PBX streaming capacity is full; using live polling.", delay) from exc
         raise RateLimitedError("PBX request limit reached; waiting before retrying.", delay) from exc
     if exc.code == 503:
         raise ServiceUnavailableError("The PBX desktop notification service is unavailable.") from exc
@@ -1370,8 +1401,12 @@ def iter_sse_events(response, *, on_activity=None, stop_event: threading.Event |
     def dispatch():
         nonlocal event_name, data_lines, retry_ms, event_bytes, explicit_id
         if not data_lines:
+            # A block with only SSE control fields does not make those fields
+            # explicit on the next data event. Keep event_id as the inherited
+            # stream cursor, but reset the per-event metadata.
             event_name = ""
             event_bytes = 0
+            explicit_id = False
             return None
         event = SseEvent(event_name or "message", "\n".join(data_lines), event_id, retry_ms, explicit_id)
         event_name = ""
@@ -1451,7 +1486,7 @@ def open_sse_response(
     try:
         response = opener.open(request, timeout=timeout)
     except urllib.error.HTTPError as exc:
-        raise_http_status(exc)
+        raise_http_status(exc, stream_request=True)
     except urllib.error.URLError as exc:
         raise ApiError(str(exc.reason)) from exc
     except TimeoutError as exc:
@@ -1630,57 +1665,32 @@ class FaultToast:
         except Exception:
             pass
 
-        canvas = tk.Canvas(
-            self.window,
-            width=self.WIDTH,
-            height=self.HEIGHT,
-            bg="#181818",
-            highlightthickness=0,
-            bd=0,
-        )
-        canvas.pack(fill="both", expand=True)
-        canvas.create_rectangle(0, 0, self.WIDTH, self.HEIGHT, fill="#181818", outline="#353535")
-        canvas.create_rectangle(0, 0, 8, self.HEIGHT, fill="#d18a00", outline="#d18a00")
-        canvas.create_text(
-            24,
-            22,
-            text="SLS Mass Notify Fault",
-            fill="#ffffff",
-            anchor="w",
-            font=("Segoe UI", 12, "bold"),
-        )
-        canvas.create_text(
-            24,
-            58,
-            text=message[:140] + ("…" if len(message) > 140 else ""),
-            fill="#f0f0f0",
-            anchor="nw",
-            width=360,
-            font=("Segoe UI", 10),
-        )
-        canvas.create_text(
-            24,
-            130,
-            text="Click to open settings. Right-click to dismiss.",
-            fill="#bdbdbd",
-            anchor="w",
-            font=("Segoe UI", 9),
-        )
-
-        self.window.bind("<Button-1>", self._open_settings)
+        self.window.withdraw()
+        tk.Frame(self.window, bg="#d18a00", width=5).pack(side="left", fill="y")
+        body = tk.Frame(self.window, bg="#181c21", padx=16, pady=12)
+        body.pack(fill="both", expand=True)
+        tk.Label(body, text="SLS Mass Notify", bg="#181c21", fg="#f3f4f6",
+                 font=("Segoe UI", 11, "bold"), anchor="w").pack(fill="x")
+        self.message_label = tk.Label(body, text=message[:220] + ("…" if len(message) > 220 else ""),
+                 bg="#181c21", fg="#dce2e9", font=("Segoe UI", 10), justify="left", anchor="w")
+        self.message_label.pack(fill="x", pady=(6, 10))
+        footer = tk.Frame(body, bg="#181c21")
+        footer.pack(fill="x")
+        for label, command in (("Settings", self._open_settings), ("Dismiss", self.hide)):
+            tk.Button(footer, text=label, command=command, bg="#2a3038", fg="#f3f4f6",
+                      activebackground="#343c46", activeforeground="#ffffff", relief="flat",
+                      padx=10, pady=4, font=("Segoe UI", 9)).pack(side="right", padx=(6, 0))
         self.window.bind("<Button-3>", lambda _event: self.hide())
-        canvas.bind("<Button-1>", self._open_settings)
-        canvas.bind("<Button-3>", lambda _event: self.hide())
         self._place()
-        if winsound is not None:
-            try:
-                winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
-            except RuntimeError:
-                pass
+        self.window.deiconify()
         self.window.after(FAULT_TOAST_VISIBLE_MS, self.hide)
 
     def _place(self) -> None:
-        fit_window(self.window, (self.WIDTH, self.HEIGHT), minimum=(320, 120))
+        width, _height = fit_window(self.window, (self.WIDTH, self.HEIGHT), minimum=(280, 120), position="bottom_right")
+        self.message_label.configure(wraplength=max(100, width-45))
+        self.window.update_idletasks()
+        fit_window(self.window, (width, max(self.HEIGHT, self.window.winfo_reqheight())),
+                   minimum=(280, 120), position="bottom_right")
 
     def _open_settings(self, _event=None) -> None:
         self.hide()
@@ -1711,6 +1721,11 @@ class SettingsWindow:
         self.startup_var = BooleanVar(value=bool(cfg.get("startup_enabled", True)))
         self.auto_update_var = BooleanVar(value=bool(cfg.get("auto_update_enabled", False)))
         self.audio_var = StringVar(value=safe_audio_name(safe_string(cfg.get("audio_sound")) or DEFAULT_AUDIO_NAME))
+        self.tts_var = BooleanVar(value=cfg.get("announcement_tts_enabled", True))
+        self.tts_voice_var = StringVar(value=VOICES[safe_voice(cfg.get("announcement_tts_voice"))])
+        self.tts_status_var = StringVar(value="")
+        self.voice_download_var = StringVar(value="")
+        self._voice_poll_id = None
         self.audio_combo: ttk.Combobox | None = None
         self.endpoint_forms: list[dict] = []
         self.endpoint_panels: list[ttk.Frame] = []
@@ -1721,6 +1736,7 @@ class SettingsWindow:
         self.test_button: ttk.Button | None = None
 
         self._build(cfg)
+        self.poll_voice_download()
         self.window.update_idletasks()
         self._center()
         self.window.lift()
@@ -1867,6 +1883,26 @@ class SettingsWindow:
             text="Custom WAV files are stored with your app settings.",
             style="Hint.TLabel",
         ).grid(row=5, column=0, columnspan=4, sticky="w", pady=(12, 0))
+        ttk.Checkbutton(audio, text="Read announcements aloud (Piper)", variable=self.tts_var,
+                        style="Card.TCheckbutton").grid(row=6, column=0, columnspan=4, sticky="w", pady=(14, 6))
+        voice_combo = ttk.Combobox(audio, textvariable=self.tts_voice_var, values=list(VOICES.values()),
+                                  state="readonly", width=36)
+        voice_combo.grid(row=7, column=0, columnspan=4, sticky="ew")
+        voice_combo.bind("<<ComboboxSelected>>", lambda _event: self.refresh_voice_controls())
+        ttk.Label(audio, text="Offline speech after the sound. Voice selection does not translate messages.",
+                  style="Hint.TLabel", wraplength=400).grid(row=9, column=0, columnspan=4, sticky="w", pady=(6, 0))
+        voice_actions = ttk.Frame(audio, style="Panel.TFrame")
+        voice_actions.grid(row=8, column=0, columnspan=4, sticky="w", pady=(8, 0))
+        self.voice_test_button = ttk.Button(voice_actions, text="Test voice", command=self.test_selected_voice)
+        self.voice_test_button.pack(side="left", padx=(0, 8))
+        self.voice_download_button = ttk.Button(voice_actions, text="Download voice", command=self.download_selected_voice)
+        self.voice_download_button.pack(side="left", padx=(0, 8))
+        self.voice_cancel_button = ttk.Button(voice_actions, text="Cancel", command=self.app.voice_downloads.cancel)
+        self.voice_cancel_button.pack(side="left")
+        ttk.Label(audio, textvariable=self.tts_status_var, style="Hint.TLabel", wraplength=400).grid(
+            row=10, column=0, columnspan=4, sticky="w", pady=(6, 0))
+        ttk.Label(audio, textvariable=self.voice_download_var, style="Hint.TLabel", wraplength=400).grid(
+            row=11, column=0, columnspan=4, sticky="w", pady=(6, 0))
         audio.columnconfigure(0, weight=1)
         self.refresh_audio_choices()
 
@@ -2036,6 +2072,51 @@ class SettingsWindow:
             self.audio_combo.configure(values=choices)
         self.audio_var.set(selected)
 
+    def test_selected_voice(self) -> None:
+        voice = next((key for key, label in VOICES.items() if label == self.tts_voice_var.get()), DEFAULT_VOICE)
+        if not voice_available(voice):
+            self.tts_status_var.set("Download this voice before testing it.")
+            return
+        self.app.test_announcement_voice(voice)
+
+    def selected_voice(self):
+        return next((key for key, label in VOICES.items() if label == self.tts_voice_var.get()), DEFAULT_VOICE)
+
+    def download_selected_voice(self):
+        voice = self.selected_voice()
+        if voice != DEFAULT_VOICE:
+            self.app.voice_downloads.start(voice)
+        self.refresh_voice_controls()
+
+    def refresh_voice_controls(self):
+        voice = self.selected_voice()
+        installed = voice_available(voice)
+        status = self.app.voice_downloads.status()
+        busy = status["state"] in {"downloading", "cancelling"}
+        self.voice_test_button.configure(state="normal" if installed else "disabled")
+        self.voice_download_button.configure(
+            text="Included" if voice == DEFAULT_VOICE else ("Repair download" if installed else "Download voice"),
+            state="disabled" if busy or voice == DEFAULT_VOICE else "normal")
+        self.voice_cancel_button.configure(state="normal" if busy else "disabled")
+        if status["state"] == "cancelling":
+            message = "Cancelling voice download…"
+        elif busy:
+            percent = min(100, int(100 * status["bytes"] / max(1, status["total"])))
+            message = f"Downloading {VOICES[status['voice']]}: {percent}%"
+        elif status["voice"] == voice and status["state"] in {"failed", "cancelled"}:
+            message = ("Download failed. Check your connection and retry." if status["state"] == "failed"
+                       else "Download cancelled. You can retry at any time.")
+        else:
+            message = ("Included; works offline." if voice == DEFAULT_VOICE else
+                       "Installed; works offline." if installed else
+                       "Download required (about 60 MiB). Announcements use Lessac low until this voice is installed.")
+        self.voice_download_var.set(message)
+
+    def poll_voice_download(self):
+        if self.window.winfo_exists():
+            self.refresh_voice_controls()
+            self._voice_poll_id = self.window.after(500, self.poll_voice_download)
+
     def play_selected_audio(self) -> None:
         name = safe_audio_name(self.audio_var.get() or DEFAULT_AUDIO_NAME)
         if not find_audio_file(name):
@@ -2150,6 +2231,8 @@ class SettingsWindow:
                 startup_enabled=self.startup_var.get(),
                 auto_update_enabled=self.auto_update_var.get(),
                 audio_sound=safe_audio_name(self.audio_var.get() or DEFAULT_AUDIO_NAME),
+                announcement_tts_enabled=self.tts_var.get(),
+                announcement_tts_voice=next((k for k, v in VOICES.items() if v == self.tts_voice_var.get()), DEFAULT_VOICE),
             )
         except Exception as exc:
             messagebox.showerror("Save settings", f"Settings were not saved. Your previous configuration was retained.\n\n{exc}")
@@ -2183,6 +2266,9 @@ class SettingsWindow:
         if self.app.tray is not None and not self.app.tray.available:
             self.window.iconify()
             return
+        if self._voice_poll_id is not None:
+            self.window.after_cancel(self._voice_poll_id)
+            self._voice_poll_id = None
         self.window.destroy()
         self.app.settings_window = None
 
@@ -2311,17 +2397,20 @@ class EndpointTransportWorker:
     def _is_current(self) -> bool:
         if self.stop_event.is_set():
             return False
+        signals = getattr(self.app, "system_signals", None)
+        if signals is not None and signals.blocked:
+            return False
         if hasattr(self.app, "workers"):
             with self.app.worker_lock:
                 return self.app.workers.get(self.index) is self
         return True
 
-    def _fault(self, message: str) -> None:
+    def _fault(self, message: str, *, recoverable: bool = False) -> None:
         if not self._is_current():
             return
         key = f"endpoint-{self.index}"
-        self.app.record_fault(key, message)
-        log(message)
+        if self.app.record_fault(key, message, recoverable=recoverable):
+            log(message)
 
     def run(self) -> None:
         if 0 < self.endpoint_cfg.get("live_polling_until", 0) - time.time() <= 86400:
@@ -2382,12 +2471,21 @@ class EndpointTransportWorker:
                 self._fault(message)
                 self.stop_event.wait()
                 return
+            except StreamCapacityError:
+                if not self._is_current():
+                    return
+                # Retry-After applies to opening another SSE stream, not to
+                # the separate authenticated polling endpoint. This worker
+                # stays in polling and discards its initial retained snapshot.
+                log(f"{name}: PBX streaming capacity is full; switching immediately to live polling.")
+                self._run_live_polling()
+                return
             except RateLimitedError as exc:
                 if self.stop_event.is_set():
                     return
                 message = f"{name}: {exc}"
                 self._status("RATE_LIMITED", message)
-                self._fault(message)
+                self._fault(message, recoverable=True)
                 if self.stop_event.wait(exc.retry_after):
                     return
                 self._run_live_polling()
@@ -2401,8 +2499,8 @@ class EndpointTransportWorker:
                     return
                 if self.authenticated_this_attempt:
                     backoff_index = 0
-                message = f"{name}: live transport fault: {safe_string(exc)}"
-                self._fault(message)
+                message = f"{name}: connection interrupted; reconnecting automatically."
+                self._fault(message, recoverable=True)
                 if not bool(self.endpoint_cfg.get("reconnect_automatically", True)):
                     self._status("DISCONNECTED", message)
                     self.stop_event.wait()
@@ -2452,10 +2550,10 @@ class EndpointTransportWorker:
                 for payload in fresh:
                     self._accept_payload(payload, json.dumps(payload), delivery_source="live polling",
                                          auth_generation=generation)
-            except UnauthorizedError as exc:
+            except (UnauthorizedError, TlsRequiredError) as exc:
                 self._invalidate_auth(revoked=True)
                 self._fault(str(exc))
-                self._status("AUTH_FAILED", f"{name}: credentials require review")
+                self._status("AUTH_FAILED" if isinstance(exc, UnauthorizedError) else "TLS_REQUIRED", f"{name}: {exc}")
                 self.stop_event.wait()
                 return
             except Exception as exc:
@@ -2464,7 +2562,7 @@ class EndpointTransportWorker:
                 if not self._is_current():
                     return
                 self.app.inbox.expire_active(profile_namespace(self.endpoint_cfg), include_displayed=False)
-                self._fault(f"{name}: live polling interrupted: {exc}")
+                self._fault(f"{name}: live polling interrupted; reconnecting automatically.", recoverable=True)
                 self._status("RECONNECTING", f"{name}: live polling interrupted; missed messages will be skipped")
                 delay = exc.retry_after if isinstance(exc, RateLimitedError) else 15.0
             if self.stop_event.wait(delay):
@@ -2496,7 +2594,7 @@ class EndpointTransportWorker:
                         self.app.clear_fault(f"receipt-{self.index}")
                     except Exception as exc:
                         self.app.inbox.receipt_failed(receipt["receipt_id"], str(exc))
-                        self.app.record_fault(f"receipt-{self.index}", "PBX receipt synchronization failed; saved receipts will retry.")
+                        self.app.record_fault(f"receipt-{self.index}", "PBX receipt synchronization failed; saved receipts will retry.", recoverable=not isinstance(exc, UnauthorizedError))
                         raise
             except UnauthorizedError as exc:
                 self._invalidate_auth(revoked=True)
@@ -2509,8 +2607,8 @@ class EndpointTransportWorker:
                     return
                 if not self._generation_is_current(generation):
                     continue
-                self.app.record_fault(f"receipt-{self.index}", f"Receipt synchronization failed: {exc}")
-                log(f"PBX {self.index + 1} receipt synchronization failed: {exc}")
+                if self.app.record_fault(f"receipt-{self.index}", "PBX receipt synchronization failed; saved receipts will retry.", recoverable=True):
+                    log(f"PBX {self.index + 1} receipt synchronization failed: {exc}")
                 delay = exc.retry_after if isinstance(exc, RateLimitedError) else 15.0
             if self.stop_event.wait(delay):
                 return
@@ -2734,31 +2832,46 @@ class MassNotifyApp:
         self.inbox.expire_active()
         self.inbox.prune(retention_days=int(self.config.get("retention_days", 30)))
         self._last_delivery_tick = time.time()
+        self._network_recovery_until = time.monotonic() + NETWORK_RECOVERY_SECONDS
+        self.fault_toast = None
         self._scheduled_records: set[str] = set()
         self.stop_event = threading.Event()
         self.wakeup_event = threading.Event()
+        self.system_signals = RecoverySignals()
         self.connection_test_event = threading.Event()
         self.worker_lock = threading.RLock()
         self.workers: dict[int, EndpointTransportWorker] = {}
         self.faults_lock = threading.RLock()
         self.ui_queue: queue.Queue[tuple[str, object]] = ControlQueue()
         self.settings_window: SettingsWindow | None = None
+        self.incident_windows: dict[tuple[str, str], IncidentResponseWindow] = {}
         self.status_text = "Waiting for PBX connection."
         self.transport_statuses: dict[int, tuple[str, str]] = {}
         self.faults: dict[str, dict] = {}
+        self.notification_audio = NotificationAudio(
+            tone=self.play_notification_sound,
+            stop=lambda: winsound.PlaySound(None, 0) if winsound else None,
+            on_error=lambda message: self.record_fault("speech", message),
+            on_success=lambda: self.clear_fault("speech"),
+            on_activity=self.speech_activity,
+            enabled=self.config.get("announcement_tts_enabled", True),
+            voice=self.config.get("announcement_tts_voice", DEFAULT_VOICE))
+        self.voice_downloads = VoiceDownloads()
         self.presenter = AlertPresenter(root,
             on_displayed=self.alert_displayed, on_acknowledged=self.alert_acknowledged,
             on_failed=self.alert_failed,
-            play_sound=self.play_notification_sound,
-            stop_sound=lambda: winsound.PlaySound(None, 0) if winsound else None,
+            audio_handler=self.notification_audio.submit,
+            cancel_audio=self.notification_audio.cancel,
             image_loader=lambda alert: fetch_image_bytes(alert.image_url, source_endpoint=alert.source_endpoint),
+            on_incident_response=self.show_incident_response,
             can_display=self.can_display_record,
             on_discarded=self._scheduled_records.discard)
         self.tray = TrayIcon(
             on_open=lambda: self.ui_queue.put(("settings", None)),
             on_history=lambda: self.ui_queue.put(("history", None)),
             on_diagnostics=lambda: self.ui_queue.put(("health", None)),
-            on_exit=lambda: self.ui_queue.put(("shutdown", None)), icon_path=icon if icon.exists() else None)
+            on_exit=lambda: self.ui_queue.put(("shutdown", None)),
+            on_system_event=self.system_signals.signal, icon_path=icon if icon.exists() else None)
         if not self.tray.start():
             self.record_fault("tray", f"Notification tray icon is unavailable: {self.tray.error}")
             show_settings_on_start = True
@@ -2797,6 +2910,10 @@ class MassNotifyApp:
             self.record_fault("audio", f"Notification sound could not play: {exc}")
             log(f"Notification sound failed: {exc}")
             return 0.0
+
+    def speech_activity(self, stage: str, voice: str, elapsed: float) -> None:
+        log(f"Announcement audio {stage}; voice={voice}; elapsed={elapsed:.2f}s")
+        self.ui_queue.put(("speech_status", stage))
 
     def alert_displayed(self, record_id: str) -> None:
         if not record_id.startswith("preview-"):
@@ -2866,30 +2983,109 @@ class MassNotifyApp:
         inbox pump after Windows resumes. Workers refuse delivery during the gap.
         """
         now = time.time()
+        signals = getattr(self, "system_signals", None)
+        generation, system_event, suspended = signals.snapshot() if signals else (0, "", False)
         with self.config_lock:
             previous = getattr(self, "_last_delivery_tick", now)
-            if 0 <= now - previous < DELIVERY_PAUSE_SECONDS:
+            if not system_event and 0 <= now - previous < DELIVERY_PAUSE_SECONDS:
                 self._last_delivery_tick = now
                 return
-            self.inbox.expire_active()
+            self.inbox.expire_active(include_displayed=system_event != "network")
             with self.worker_lock:
-                workers = list(self.workers.values())
-                self.workers.clear()
+                # A network or power change cannot reauthorize rejected
+                # credentials. Those workers stay fenced until settings change.
+                workers = [worker for worker in self.workers.values() if not worker.revoked_event.is_set()]
+                for worker in workers:
+                    self.workers.pop(worker.index, None)
+                    self.transport_statuses.pop(worker.index, None)
             self._last_delivery_tick = now
+            if signals:
+                signals.complete(generation)
+        self.begin_network_recovery()
         for worker in workers:
-            worker.stop()
+            worker.stop_event.set()
+        if workers:
+            def retire():
+                for worker in workers:
+                    worker.stop()
+            threading.Thread(target=retire, name="RetireConnections", daemon=True).start()
         self.wakeup_event.set()
+
+    def begin_network_recovery(self) -> None:
+        """Allow Windows to restore the NIC without aging transient faults in sleep."""
+        with self.faults_lock:
+            self._network_recovery_until = time.monotonic() + NETWORK_RECOVERY_SECONDS
+            for key in list(self.faults):
+                if self.faults[key].get("recoverable"):
+                    del self.faults[key]
+        self.ui_queue.put(("status", "Reconnecting after wake; waiting for the network."))
 
     def evaluate_faults(self) -> None:
         now = time.monotonic()
         with self.faults_lock:
-            for fault in self.faults.values():
+            for key, fault in self.faults.items():
                 if not fault.get("notified") and now - fault["started_at"] >= FAULT_NOTIFY_SECONDS:
                     fault["notified"] = True
-                    self.ui_queue.put(("fault", fault["message"]))
+                    self.ui_queue.put(("fault", (key, fault["token"])))
 
     def show_history(self) -> None:
         self.presenter.show_history(self.inbox.history())
+
+    def show_incident_response(self, record_id: str) -> None:
+        record = self.inbox.record(record_id)
+        if record is None:
+            return
+        identifier = record["payload"].get("response_incident_id", "")
+        key = (record["namespace"], identifier)
+        windows = getattr(self, "incident_windows", None)
+        if windows is None:
+            self.incident_windows = windows = {}
+        existing = windows.get(key)
+        if existing is not None and existing.window.winfo_exists():
+            existing.window.deiconify()
+            existing.window.lift()
+            return
+        for old_key, window in list(windows.items()):
+            if not window.window.winfo_exists():
+                del windows[old_key]
+        cfg = self.get_config()
+        profile = next((profile for _, profile in active_endpoints(cfg)
+                        if profile_namespace(profile) == record["namespace"]), None)
+        if not cfg.get("enabled", True) or profile is None:
+            messagebox.showinfo("Incident response", "Enable the original PBX profile to respond to this incident.")
+            return
+        signature = endpoint_worker_signature(profile)
+
+        def current_profile():
+            current = self.get_config()
+            if (self.stop_event.is_set() or not current.get("enabled", True)
+                    or not any(endpoint_worker_signature(item) == signature for _, item in active_endpoints(current))):
+                raise UnauthorizedError("The PBX profile changed. Close this response window and reopen it.")
+            signals = getattr(self, "system_signals", None)
+            if signals is not None and signals.blocked:
+                raise ApiError("Windows is restoring the connection. Retry when the network returns.")
+
+        def request(method, path, body):
+            current_profile()
+            headers = {"Accept": "application/json", "Content-Type": "application/json",
+                       "User-Agent": f"{APP_SHORT_NAME}/{APP_VERSION}",
+                       **endpoint_auth_headers(profile), **desktop_client_headers()}
+            req = urllib.request.Request(normalize_pbx_address(profile["endpoint"]) + path,
+                data=json.dumps(body).encode("utf-8") if body is not None else None,
+                headers=headers, method=method)
+            try:
+                with open_http_request(req, timeout=10, same_origin=True) as response:
+                    with SocketDeadline(response_socket(response), 10):
+                        raw = response.read(256 * 1024 + 1)
+            except urllib.error.HTTPError as exc:
+                raise_http_status(exc)
+            if len(raw) > 256 * 1024:
+                raise StreamProtocolError("Incident response exceeds the safety limit")
+            current_profile()
+            return json.loads(raw.decode("utf-8"))
+
+        client = IncidentClient(request, self.inbox, record["namespace"], profile["username"], identifier)
+        windows[key] = IncidentResponseWindow(self.root, client)
 
     def show_health(self) -> None:
         with self.worker_lock:
@@ -2899,7 +3095,7 @@ class MassNotifyApp:
         lines.append("Inbox: " + json.dumps(self.inbox.statistics()))
         for rejected in self.inbox.quarantined():
             lines.append(f"Rejected notification {rejected['event_id']}: {rejected['error']}")
-        lines.append("Receipt ACKs retry automatically. 'I have read this alert' is stored locally; human responses require a separate PBX API.")
+        lines.append("Receipt ACKs retry automatically. Dismiss/read controls are local. Use 'Respond to incident' for explicit PBX human responses; unconfirmed responses require a deliberate retry.")
         cfg = self.get_config()
         if cfg.get("downloaded_update_tag"):
             lines.append(f"Update {cfg['downloaded_update_tag']} downloaded for administrator review: {cfg.get('downloaded_update_path', '')}")
@@ -2929,6 +3125,12 @@ class MassNotifyApp:
             "body": "This is a local display and sound test. No notification was sent to the PBX or other devices.",
             "priority": "notice", "is_test": True, "test_only": True}, ""))
 
+    def test_announcement_voice(self, voice: str) -> None:
+        self.notification_audio.submit("voice-test-" + secrets.token_hex(8),
+            {"kind": "announcement", "title": "Voice test",
+             "body": "This is a test of your selected announcement voice.", "raw": {"is_test": True}},
+            3, time.time() + 30, voice=safe_voice(voice), speech_enabled=True, tone_enabled=False)
+
     def is_configured(self) -> bool:
         with self.config_lock:
             return bool(active_endpoints(self.config))
@@ -2948,7 +3150,9 @@ class MassNotifyApp:
             return safe_string(endpoint.get(key, ""))
 
     def update_settings(self, *, endpoints: list[dict], enabled: bool,
-                        startup_enabled: bool, auto_update_enabled: bool, audio_sound: str) -> None:
+                        startup_enabled: bool, auto_update_enabled: bool, audio_sound: str,
+                        announcement_tts_enabled: bool | None = None,
+                        announcement_tts_voice: str | None = None) -> None:
         staged_targets = []
         retired_targets = []
         with self.config_lock:
@@ -2987,7 +3191,10 @@ class MassNotifyApp:
                             candidate[key] = old.get(key, [] if key == "recent_event_ids" else "")
                 updated = normalize_config(dict(self.config, endpoints=new_profiles, enabled=bool(enabled),
                     startup_enabled=bool(startup_enabled), auto_update_enabled=bool(auto_update_enabled),
-                    audio_sound=safe_audio_name(audio_sound or DEFAULT_AUDIO_NAME)))
+                    audio_sound=safe_audio_name(audio_sound or DEFAULT_AUDIO_NAME),
+                    announcement_tts_enabled=(self.config.get("announcement_tts_enabled", True)
+                                              if announcement_tts_enabled is None else bool(announcement_tts_enabled)),
+                    announcement_tts_voice=safe_voice(announcement_tts_voice or self.config.get("announcement_tts_voice"))))
                 save_config(updated)
                 self.config = updated
             except Exception:
@@ -3003,6 +3210,12 @@ class MassNotifyApp:
             except OSError:
                 log("Could not remove a retired credential")
         set_startup_enabled(startup_enabled)
+        if hasattr(self, "notification_audio"):
+            self.notification_audio.configure(updated["announcement_tts_enabled"], updated["announcement_tts_voice"])
+            if not updated["announcement_tts_enabled"]:
+                self.clear_fault("speech")
+            if not enabled:
+                self.notification_audio.cancel()
         self.wakeup_event.set()
 
     def command_server(self) -> None:
@@ -3013,13 +3226,23 @@ class MassNotifyApp:
         except Exception as exc:
             self.record_fault("ipc", f"Local control unavailable: {exc}")
 
-    def record_fault(self, key: str, message: str) -> None:
+    def record_fault(self, key: str, message: str, *, recoverable: bool = False) -> bool:
         with self.faults_lock:
+            if recoverable and time.monotonic() < getattr(self, "_network_recovery_until", 0):
+                return False
             is_new = key not in self.faults
-            fault = self.faults.setdefault(key, {"started_at": time.monotonic(), "notified": False})
+            fault = self.faults.setdefault(key, {"started_at": time.monotonic(), "notified": False,
+                                               "token": secrets.token_hex(8)})
+            if fault.get("recoverable") and not recoverable:
+                # An authentication/configuration failure is a new fault, even if
+                # a connection interruption previously occupied the same key.
+                fault.update(started_at=time.monotonic(), notified=False, token=secrets.token_hex(8))
+                is_new = True
+            fault["recoverable"] = recoverable
             fault["message"] = message
         if is_new:
             self.ui_queue.put(("status", self.status_text))
+        return is_new
 
     def clear_fault(self, key: str | None = None) -> None:
         with self.faults_lock:
@@ -3049,6 +3272,9 @@ class MassNotifyApp:
     def accept_alert(self, index: int, alert: AlertData, worker_signature: str = "") -> bool:
         with self.config_lock:
             now = time.time()
+            signals = getattr(self, "system_signals", None)
+            if signals is not None and signals.blocked:
+                return False
             gap = now - getattr(self, "_last_delivery_tick", now)
             if gap < 0 or gap >= DELIVERY_PAUSE_SECONDS:
                 return False  # The UI must discard the suspended session first.
@@ -3137,7 +3363,8 @@ class MassNotifyApp:
                             self.workers.pop(index, None)
                             self.transport_statuses.pop(index, None)
                     for index, endpoint_cfg in desired.items():
-                        if index not in self.workers:
+                        signals = getattr(self, "system_signals", None)
+                        if index not in self.workers and not (signals is not None and signals.blocked):
                             endpoint_cfg["last_stream_id"] = self.inbox.cursor(profile_namespace(endpoint_cfg))
                             worker = EndpointTransportWorker(self, index, endpoint_cfg)
                             self.workers[index] = worker
@@ -3208,6 +3435,14 @@ class MassNotifyApp:
             self.config = staged
 
     def process_ui_queue(self) -> None:
+        self.check_delivery_resume()
+        toast = getattr(self, "fault_toast", None)
+        if toast is not None:
+            with self.faults_lock:
+                fault = self.faults.get(toast.fault_key)
+                if fault is None or fault["token"] != toast.fault_token:
+                    toast.hide()
+                    self.fault_toast = None
         deadline = time.monotonic() + 0.015
         for _ in range(32):
             if time.monotonic() > deadline:
@@ -3218,7 +3453,22 @@ class MassNotifyApp:
                 break
             try:
                 if kind == "fault":
-                    FaultToast(self, safe_string(value))
+                    key, token = value
+                    with self.faults_lock:
+                        fault = self.faults.get(key)
+                        if fault is None or fault["token"] != token:
+                            continue  # Resolved/replaced while queued, including wake.
+                        message = fault["message"]
+                    if getattr(self, "fault_toast", None) is not None:
+                        self.fault_toast.hide()
+                    self.fault_toast = FaultToast(self, message)
+                    self.fault_toast.fault_key, self.fault_toast.fault_token = key, token
+                elif kind == "speech_status":
+                    if self.settings_window is not None and self.settings_window.window.winfo_exists():
+                        messages = {"preparing": "Preparing speech…", "playing": "Reading aloud…",
+                                    "finished": "Speech finished.", "cancelled": "Speech stopped."}
+                        self.settings_window.tts_status_var.set(messages.get(value,
+                            "Speech unavailable. See Health for details."))
                 elif kind == "settings":
                     self.show_settings()
                 elif kind == "history":
@@ -3384,6 +3634,8 @@ class MassNotifyApp:
         self.stop_event.set()
         self.wakeup_event.set()
         self.presenter.shutdown()
+        self.notification_audio.close()
+        self.voice_downloads.cancel()
         with self.worker_lock:
             workers = list(self.workers.values())
             self.workers.clear()
@@ -3411,6 +3663,21 @@ class MassNotifyApp:
 
 
 def main() -> None:
+    if len(sys.argv) == 3 and sys.argv[1] == "--check-announcement-audio":
+        from sls_speech_probe import check
+        try:
+            report = check(sys.modules[__name__])
+            Path(sys.argv[2]).write_text(json.dumps(report), encoding="utf-8")
+        except Exception:
+            raise SystemExit(1) from None
+        return
+    if len(sys.argv) == 4 and sys.argv[1] == "--synthesize-announcement":
+        from sls_speech import synthesize_file
+        try:
+            synthesize_file(Path(sys.argv[2]), Path(sys.argv[3]))
+        except Exception:
+            raise SystemExit(1) from None
+        return
     if "--check-presentation" in sys.argv:
         from sls_presentation_probe import check_presentation
         try:

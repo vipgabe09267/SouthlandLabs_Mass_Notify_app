@@ -282,8 +282,19 @@ class SseProtocolTests(unittest.TestCase):
         activity = []
         events = list(app.iter_sse_events(body, on_activity=lambda: activity.append(True)))
         self.assertEqual(["authenticated", "notification", "reconnect"], [item.name for item in events])
+        self.assertEqual(1000, events[0].retry_ms)
         self.assertEqual("announcement-1", events[1].event_id)
         self.assertGreater(len(activity), len(events))
+
+    def test_control_block_id_is_inherited_but_not_explicit_on_next_event(self):
+        body = io.BytesIO(
+            b"id: control-cursor\n\n"
+            b"event: notification\n"
+            b'data: {"id":"payload-id","message":"hello"}\n\n'
+        )
+        event = list(app.iter_sse_events(body))[0]
+        self.assertEqual("control-cursor", event.event_id)
+        self.assertFalse(event.explicit_id)
 
     def test_oversize_line_is_rejected(self):
         body = io.BytesIO(b"data: " + (b"x" * app.SSE_MAX_LINE_BYTES) + b"\n\n")

@@ -7,7 +7,7 @@ import sys
 import zipfile
 
 ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "src"))
 from sls_version import VERSION, VERSION_TUPLE
 from sls_install_windows import system_directory
 
@@ -46,7 +46,7 @@ def main():
     executable = ROOT / "dist" / "SLS_Mass_Notify_Installer.exe"
     subprocess.run([str(compiler), "/nologo", "/target:winexe", "/platform:x64", "/optimize+",
                     "/reference:System.Windows.Forms.dll", "/reference:System.IO.Compression.dll",
-                    "/win32icon:" + str(ROOT / "favicon.ico"),
+                    "/win32icon:" + str(ROOT / "assets" / "favicon.ico"),
                     "/win32manifest:" + str(ROOT / "tools" / "setup-bootstrap.manifest"),
                     "/resource:" + str(archive) + ",setup-payload.zip",
                     "/out:" + str(executable), str(ROOT / "tools" / "setup-bootstrap.cs"), str(metadata)], check=True)
