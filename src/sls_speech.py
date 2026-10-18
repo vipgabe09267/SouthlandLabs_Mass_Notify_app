@@ -18,27 +18,11 @@ import wave
 
 from sls_audio import inspect_wav
 from sls_presentation import explicit_test_mode, field
+from sls_voices import DEFAULT_VOICE, VOICES, VoiceStore, safe_voice, playback_voice
 
 MAX_TEXT = 2000
 MAX_SPEECH_SECONDS = 120
 SYNTHESIS_TIMEOUT = 60
-DEFAULT_VOICE = "en_US-lessac-low"
-VOICES = {
-    "en_US-lessac-low": "English (US) · lessac · low (default)",
-    "en_US-amy-low": "English (US) · amy · low",
-    "en_US-lessac-medium": "English (US) · lessac · medium",
-    "en_US-ryan-low": "English (US) · ryan · low",
-    "fr_FR-siwis-medium": "French · siwis · medium",
-    "de_DE-thorsten-low": "German · thorsten · low",
-    "pt_BR-faber-medium": "Portuguese (Brazil) · faber · medium",
-    "es_ES-davefx-medium": "Spanish · davefx · medium",
-}
-
-
-def safe_voice(value):
-    return value if isinstance(value, str) and value in VOICES else DEFAULT_VOICE
-
-
 def announcement_text(alert) -> str:
     if str(field(alert, "kind")).lower() != "announcement":
         return ""
@@ -57,8 +41,7 @@ def announcement_text(alert) -> str:
 
 
 def model_path(voice=DEFAULT_VOICE) -> Path:
-    base = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent.parent / ".tools"))
-    return base / "tts" / (safe_voice(voice) + ".onnx")
+    return VoiceStore().model(safe_voice(voice))
 
 
 def synthesize_file(request_path: Path, output_path: Path) -> None:
@@ -146,11 +129,12 @@ class AudioJob:
 class NotificationAudio:
     """Serialize tones and speech; higher priority alerts interrupt immediately."""
     def __init__(self, *, tone, stop, on_error, on_success=None, on_activity=None, enabled=True, voice=DEFAULT_VOICE,
-                 synthesize=synthesize_hidden, play=None):
+                 synthesize=synthesize_hidden, play=None, resolve_voice=playback_voice):
         self._tone, self._stop, self._on_error = tone, stop, on_error
         self._on_success = on_success
         self._on_activity = on_activity
         self._synthesize, self._play = synthesize, play
+        self._resolve_voice = resolve_voice
         self._enabled = bool(enabled)
         self._voice = safe_voice(voice)
         self._condition = threading.Condition()
@@ -262,7 +246,8 @@ class NotificationAudio:
                 text = announcement_text(job.alert)
                 with self._condition:
                     speak = self._speech_enabled(job) and bool(text) and self._valid(job)
-                    voice = job.voice or self._voice
+                    voice = self._resolve_voice(job.voice or self._voice)
+                    job.voice = voice
                 if speak:
                     preparing = True
                     self._activity(job, "preparing")

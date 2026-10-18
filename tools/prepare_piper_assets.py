@@ -1,7 +1,4 @@
-"""Download build-time voice assets from reviewed, size/hash-pinned URLs.
-
-The installed app never downloads executable code or models at runtime.
-"""
+"""Cache pinned speech assets and stage only the included Lessac low voice."""
 import hashlib
 import json
 import os
@@ -9,8 +6,12 @@ from pathlib import Path
 import shutil
 import tempfile
 import urllib.request
+import sys
 
 ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "src"))
+from sls_voices import DEFAULT_VOICE, read_catalog
+from sls_install_safety import remove_staging, reject_reparse
 
 
 def matches(path, entry):
@@ -25,8 +26,10 @@ def prepare():
     if destination.is_symlink() or destination.parent.is_symlink():
         raise ValueError("Refusing linked speech asset directory")
     destination.mkdir(parents=True, exist_ok=True)
-    manifest = json.loads((ROOT / "tools" / "piper-voices.json").read_text(encoding="utf-8"))
+    manifest = read_catalog()
     for entry in manifest["files"]:
+        if not entry["name"].startswith(DEFAULT_VOICE + "."):
+            continue
         name = entry["name"]
         if Path(name).name != name or not 0 < entry["size"] <= 80 * 1024 * 1024:
             raise ValueError("Invalid voice manifest entry")
@@ -50,8 +53,19 @@ def prepare():
             temporary.replace(target)
         finally:
             temporary.unlink(missing_ok=True)
-    shutil.copyfile(ROOT / "THIRD_PARTY_NOTICES.md", destination / "THIRD_PARTY_NOTICES.md")
-    print("Verified all eight Piper voices and model cards.")
+    stage = ROOT / "build" / "tts"
+    if not stage.resolve().is_relative_to((ROOT / "build").resolve()):
+        raise ValueError("Voice staging directory escaped build output")
+    reject_reparse(stage)
+    if stage.exists():
+        remove_staging(stage)
+    stage.mkdir(parents=True)
+    for entry in manifest["files"]:
+        if entry["name"].startswith(DEFAULT_VOICE + "."):
+            shutil.copyfile(destination / entry["name"], stage / entry["name"])
+    shutil.copyfile(ROOT / "tools/piper-voices.json", stage / "voices.json")
+    shutil.copyfile(ROOT / "THIRD_PARTY_NOTICES.md", stage / "THIRD_PARTY_NOTICES.md")
+    print("Verified and staged Lessac low; seven optional voices remain download-only.")
 
 
 if __name__ == "__main__":

@@ -66,6 +66,7 @@ def main():
                 result.attributes("-alpha", 0.0)
                 return result
             app = mock.Mock(root=root, status_text="Checking delivery.")
+            app.voice_downloads.status.return_value = {"voice": "", "state": "idle", "bytes": 0, "total": 0}
             app.get_config.return_value = client.normalize_config({"enabled": False})
             try:
                 with mock.patch.object(client, "Toplevel", side_effect=invisible):
