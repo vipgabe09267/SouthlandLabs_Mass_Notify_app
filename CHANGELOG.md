@@ -1,13 +1,11 @@
 # Changelog
 
-## Unreleased - 1.0.15-beta
+## 1.0.15-beta - 2026-10-17
 
 - Prepare announcement speech while the notification chime is playing, instead of adding synthesis time after the chime. Add a dedicated Test voice control with preparation/playback status and private diagnostic timings.
 - Verify local preview and a normal announcement through the packaged presenter, audio queue, child synthesis, non-silent PCM, and intercepted Windows playback calls. Voice model synthesis alone is no longer the only speech integration check.
 - Verify unchanged installed files but leave them in place. Back up only files that need replacement and persist the complete recovery plan once, avoiding a growing journal rewrite and disk flush for every file. Keep rollback, interrupted-upgrade recovery, missing-file repair, and modified-file rejection.
 - Exercise a full application-and-voice upgrade in an isolated fixture, verify every installed hash, and confirm all eight unchanged models keep their file identities. Record phase timings without touching the machine's registry, shortcuts, or running client.
-
-## 1.0.14-beta - Local build
 
 - Fix upgrades rejecting unchanged Microsoft runtime DLLs when the new package changes filename capitalization. Preserve one manifest entry per Windows path, verify the previous hash, and retain rollback and interrupted-upgrade recovery.
 - Wrap installer status messages and let the terms/log panels fit the available width, so long error paths do not stretch setup horizontally.

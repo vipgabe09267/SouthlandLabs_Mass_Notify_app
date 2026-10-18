@@ -8,7 +8,7 @@
 
 The desktop client for [Southland Servers Mass Notify for FreePBX](https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_server).
 
-[**Download the installer · 1.0.11-beta**](https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_app/releases/download/v1.0.11-beta/SLS_Mass_Notify_Installer.exe) · [Release notes](CHANGELOG.md) · [Windows build checks](https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_app/actions/workflows/ci.yml)
+[**Download the installer · 1.0.15-beta**](https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_app/releases/download/v1.0.15-beta/SLS_Mass_Notify_Installer.exe) · [Release notes](CHANGELOG.md) · [Windows build checks](https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_app/actions/workflows/ci.yml)
 
 </div>
 
@@ -26,7 +26,7 @@ The connection test does not send an announcement. Up to three PBX profiles can 
 
 **Releases contain one uploaded asset: the installer EXE.** GitHub also supplies source ZIP/TAR archives automatically. Those are for developers and are not installation packages.
 
-The current source is **1.0.15-beta**, pending release. The download above remains the published **1.0.11-beta** installer.
+The current prerelease is **1.0.15-beta**. Announcements can now be read aloud offline, with voice selection and a separate **Test voice** control in Settings.
 
 ## What the app does
 
