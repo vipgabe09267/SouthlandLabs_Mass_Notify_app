@@ -1,16 +1,20 @@
 """Pinned voice catalog, bundled default, and explicit per-user downloads."""
 from pathlib import Path
 import hashlib
+import http.client
 import json
 import os
 import re
 import shutil
+import socket
 import sys
 import tempfile
 import threading
 import time
 import urllib.parse
+import urllib.error
 import urllib.request
+from functools import partial
 
 from sls_install_safety import reject_reparse
 
@@ -26,6 +30,92 @@ VOICES = {
     "es_ES-davefx-medium": "Spanish · davefx · medium",
 }
 SUFFIXES = (".onnx", ".onnx.json", ".MODEL_CARD")
+VOICE_DOWNLOAD_SECONDS = 600
+VOICE_HEADER_SECONDS = 15
+
+
+class VoiceDownloadCancelled(Exception):
+    pass
+
+
+def transfer_socket(response):
+    return (getattr(getattr(getattr(response, "fp", None), "raw", None), "_sock", None)
+            or getattr(getattr(response, "fp", None), "_sock", None))
+
+
+class TransferDeadline:
+    """Interrupt an active read on cancellation or the original total deadline."""
+    def __init__(self, sock, deadline, cancelled):
+        self.sock, self.deadline, self.cancelled = sock, deadline, cancelled
+        self._lock = threading.Lock()
+        self._done = threading.Event()
+        self._expired = False
+        self._cancelled = False
+        self._thread = None
+
+    def _watch(self):
+        while not self._done.wait(min(0.05, max(0.001, self.deadline - time.monotonic()))):
+            with self._lock:
+                if self._done.is_set():
+                    return
+                self._cancelled = self.cancelled.is_set()
+                self._expired = time.monotonic() >= self.deadline
+                if self._cancelled or self._expired:
+                    try:
+                        self.sock.shutdown(socket.SHUT_RDWR)
+                    except (OSError, AttributeError):
+                        pass
+                    return
+
+    def __enter__(self):
+        if self.cancelled.is_set():
+            raise VoiceDownloadCancelled()
+        if time.monotonic() >= self.deadline:
+            raise TimeoutError("Voice download timed out")
+        if self.sock is not None:
+            self._thread = threading.Thread(target=self._watch, name="VoiceTransferDeadline", daemon=True)
+            self._thread.start()
+        return self
+
+    def __exit__(self, kind, value, traceback):
+        with self._lock:
+            self._done.set()
+            self.sock = None
+        if self._thread is not None:
+            self._thread.join(0.2)
+        if self._cancelled or self.cancelled.is_set():
+            raise VoiceDownloadCancelled() from value
+        if self._expired or time.monotonic() >= self.deadline:
+            raise TimeoutError("Voice download timed out") from value
+
+
+class VoiceHTTPSConnection(http.client.HTTPSConnection):
+    def __init__(self, *args, transfer_deadline, cancel_event, **kwargs):
+        self.transfer_deadline, self.cancel_event = transfer_deadline, cancel_event
+        super().__init__(*args, **kwargs)
+
+    def getresponse(self):
+        response = None
+        try:
+            deadline = min(self.transfer_deadline, time.monotonic() + VOICE_HEADER_SECONDS)
+            with TransferDeadline(self.sock, deadline, self.cancel_event):
+                response = super().getresponse()
+            return response
+        except BaseException:
+            if response is not None:
+                response.close()
+            self.close()
+            raise
+
+
+class VoiceHTTPSHandler(urllib.request.HTTPSHandler):
+    def __init__(self, deadline, cancelled):
+        super().__init__()
+        self.deadline, self.cancelled = deadline, cancelled
+
+    def https_open(self, request):
+        connection = partial(VoiceHTTPSConnection, transfer_deadline=self.deadline, cancel_event=self.cancelled)
+        return self.do_open(connection, request, context=self._context)
 
 
 def safe_voice(value):
@@ -120,16 +210,18 @@ class VoiceStore:
         reject_reparse(target)
         total = sum(entry["size"] for entry in entries)
         completed = 0
-        deadline = time.monotonic() + 600
+        deadline = time.monotonic() + VOICE_DOWNLOAD_SECONDS
         # No PBX credentials, cookies, or announcement text enter these requests.
-        opener = opener or urllib.request.build_opener(HTTPSRedirects())
+        opener = opener or urllib.request.build_opener(HTTPSRedirects(), VoiceHTTPSHandler(deadline, cancelled))
         temporary = Path(tempfile.mkdtemp(prefix=".download-", dir=self.cache))
         try:
             for entry in entries:
                 if cancelled.is_set():
                     return False
                 request = urllib.request.Request(entry["url"], headers={"User-Agent": "SLS-Mass-Notify-Voice-Download"})
-                with opener.open(request, timeout=15) as response, (temporary / entry["name"]).open("wb") as output:
+                with opener.open(request, timeout=15) as response, \
+                     TransferDeadline(transfer_socket(response), deadline, cancelled), \
+                     (temporary / entry["name"]).open("wb") as output:
                     size = 0
                     while True:
                         if cancelled.is_set():
@@ -160,6 +252,11 @@ class VoiceStore:
                 reject_reparse(destination)
                 os.replace(temporary / entry["name"], destination)
             return True
+        except VoiceDownloadCancelled:
+            return False
+        except urllib.error.HTTPError as error:
+            error.close()
+            raise
         finally:
             reject_reparse(temporary)
             shutil.rmtree(temporary)

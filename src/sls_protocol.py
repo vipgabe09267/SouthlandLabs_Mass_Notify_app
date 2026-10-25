@@ -9,21 +9,33 @@ from datetime import datetime, timezone
 from urllib.parse import urlparse
 
 
-ID_PATTERN = re.compile(r"[\x21-\x7e]{1,1024}\Z")
+ID_CONTROL_CHARACTERS = re.compile(r"[\x00-\x1f\x7f]")
+ANNOUNCEMENT_MAX_AGE_SECONDS = 600
 
 
 def validate_id(value: object, *, optional: bool = True) -> str:
     if optional and value in (None, ""):
         return ""
-    if not isinstance(value, str) or not ID_PATTERN.fullmatch(value):
-        raise ValueError("Event identifier must contain 1-1024 printable ASCII characters without whitespace")
+    if (not isinstance(value, str) or not value or len(value) > 2048
+            or value.strip(" \t\n\r\x00\x0b") != value or ID_CONTROL_CHARACTERS.search(value)):
+        raise ValueError("Event identifier must contain 1-2048 UTF-8 bytes without control characters or surrounding whitespace")
+    try:
+        encoded = value.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise ValueError("Event identifier is not valid Unicode") from exc
+    if len(encoded) > 2048:
+        raise ValueError("Event identifier exceeds 2048 UTF-8 bytes")
     return value
 
 
 def profile_namespace(profile: dict) -> str:
-    parsed = urlparse(str(profile.get("endpoint", "")))
+    address = str(profile.get("endpoint", "")).strip()
+    parsed = urlparse(address if "://" in address else "https://" + address)
     origin = (parsed.scheme.lower(), (parsed.hostname or "").lower(), parsed.port or 443)
-    return hashlib.sha256(json.dumps([origin, profile.get("username", "")], separators=(",", ":")).encode()).hexdigest()
+    identity = [origin, profile.get("username", "")]
+    if profile.get("desktop_client_id"):
+        identity.append(profile["desktop_client_id"])
+    return hashlib.sha256(json.dumps(identity, separators=(",", ":")).encode()).hexdigest()
 
 
 def timestamp(value: object) -> float | None:
@@ -116,21 +128,48 @@ def validate_payload(payload: object) -> dict:
     timestamp(payload.get("created_at"))
     if effective is not None and expires is not None and expires <= effective:
         raise ValueError("Notification expiry must follow its effective time")
-    if "display_timeout_seconds" in payload:
+    if payload.get("display_timeout_seconds") is not None:
         timeout = payload["display_timeout_seconds"]
-        if type(timeout) is not int or not 0 <= timeout <= 86400:
-            raise ValueError("Display timeout must be an integer from 0 to 86400 seconds")
-    if payload.get("display_timeout_seconds") != 0:
-        timestamp(payload.get("display_expires_at"))
+        if type(timeout) is not int or timeout < 0:
+            raise ValueError("Display timeout must be a nonnegative integer")
+    timestamp(payload.get("display_expires_at"))
     return payload
 
 
 def is_test(payload: object) -> bool:
+    if isinstance(payload, dict) and type(payload.get("is_test")) is bool:
+        return payload["is_test"]
     return isinstance(payload, dict) and (
         payload.get("test_only") is True or payload.get("test") is True or payload.get("is_test") is True
         or str(payload.get("severity", "")).lower() == "test"
         or str(payload.get("status", "")).lower() in {"test", "exercise"}
     )
+
+
+def notification_expiry(payload: dict, *, received_at: float | None = None) -> float | None:
+    """Original absolute deadlines, shared by storage, audio and presentation."""
+    deadlines = []
+    for name in ("expires", "display_expires_at", "delivery_expires_at"):
+        value = timestamp(payload.get(name))
+        if value is not None:
+            deadlines.append(value)
+    if str(payload.get("kind", "")).lower() == "announcement":
+        published = timestamp(payload.get("created_at"))
+        if published is not None:
+            start = min(published, received_at) if received_at is not None else published
+        else:
+            start = received_at
+        if start is not None:
+            deadlines.append(start + ANNOUNCEMENT_MAX_AGE_SECONDS)
+            timeout = payload.get("display_timeout_seconds")
+            if type(timeout) is int and timeout > 0:
+                deadlines.append(start + min(timeout, ANNOUNCEMENT_MAX_AGE_SECONDS))
+    return min(deadlines) if deadlines else None
+
+
+def wants_beep(value: object = True) -> bool:
+    """The existing producer uses yes/no; newer booleans retain their meaning."""
+    return value is True or (isinstance(value, str) and value.strip().lower() in {"yes", "true", "1"})
 
 
 def notification_priority(*, severity: object = "", priority: object = "", priority_label: object = "", kind: object = "") -> int:
@@ -193,7 +232,7 @@ def ordered_reconciliation(data: object, last_event_id: str = "") -> list[dict]:
         events.reverse()
     latest = data.get("latest")
     # A latest-only older PBX is supported, but cannot prove gap-free replay.
-    if isinstance(latest, dict):
+    if "events" not in data and isinstance(latest, dict):
         latest_id = (latest.get("id", latest.get("event_id")), latest.get("revision", 0))
         if not any((v.get("id", v.get("event_id")), v.get("revision", 0)) == latest_id for v in events):
             events.append(latest)

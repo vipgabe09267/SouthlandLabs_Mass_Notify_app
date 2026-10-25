@@ -11,10 +11,10 @@ import urllib.request
 import zipfile
 from pathlib import Path, PurePosixPath
 
-VERSION = "3.14.7"
+VERSION = "3.14.9"
 BASE = f"https://www.python.org/ftp/python/{VERSION}/"
 ARCHIVE = f"python-{VERSION}-amd64.zip"
-EXPECTED_SHA256 = "ac1a727a71738e11de80b76e975f9b8a258aea6412bfc31696b929d59c6aafd0"
+EXPECTED_SHA256 = "874d01bac04b470c6e1422dfccb9e182b9efe90c6a8adc5fc50d66bf84c40191"
 
 
 def main():

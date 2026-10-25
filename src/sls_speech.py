@@ -1,4 +1,4 @@
-"""Offline announcement speech and interruptible notification audio.
+"""Offline notification speech and interruptible notification audio.
 
 Piper runs in a hidden child process. Notification text stays on this computer;
 neither the UI thread nor a PBX connection waits for speech synthesis.
@@ -19,46 +19,57 @@ import wave
 from sls_audio import inspect_wav
 from sls_presentation import explicit_test_mode, field
 from sls_voices import DEFAULT_VOICE, VOICES, VoiceStore, safe_voice, playback_voice
+from sls_protocol import wants_beep
+from sls_speech_worker import PiperWorker, speech_command
 
 MAX_TEXT = 2000
 MAX_SPEECH_SECONDS = 120
 SYNTHESIS_TIMEOUT = 60
 def announcement_text(alert) -> str:
-    if str(field(alert, "kind")).lower() != "announcement":
+    kind = str(field(alert, "kind")).lower()
+    if kind not in {"announcement", "alert"}:
         return ""
     # Use the normalized text, never image URLs, XML, HTML or raw payloads.
     body = str(field(alert, "body") or field(alert, "description") or "").strip()
-    if not body:
-        return ""
-    title = str(field(alert, "title") or "Announcement").strip()
-    value = f"{title}. {body}" if title.casefold() != body.casefold() else body
+    instructions = str(field(alert, "instructions") or "").strip()
+    title = str(field(alert, "title") or ("Weather alert" if kind == "alert" else "Announcement")).strip()
+    parts = [title]
+    # Weather instructions must not disappear behind a lengthy description.
+    for value in ((instructions, body) if kind == "alert" else (body, instructions)):
+        if value and all(value.casefold() != part.casefold() for part in parts):
+            parts.append(value)
+    if not body and not instructions:
+        parts.append("Read the notification on screen.")
+    value = ". ".join(parts)
     # Piper's phoneme markup must not be interpreted from an untrusted message.
     value = " ".join(value.replace("[", " ").replace("]", " ").split())
     value = "".join(c for c in value if c.isprintable())
     if len(value) > MAX_TEXT:
-        value = value[:MAX_TEXT].rsplit(" ", 1)[0] + ". Read the full announcement on screen."
-    return ("Test announcement. " if explicit_test_mode(alert) is True else "") + value
+        noun = "alert" if kind == "alert" else "announcement"
+        value = value[:MAX_TEXT].rsplit(" ", 1)[0] + f". Read the full {noun} on screen."
+    marker = ("Test alert. " if kind == "alert" else "Test announcement. ")
+    return (marker if explicit_test_mode(alert) is True else "") + value
 
 
 def model_path(voice=DEFAULT_VOICE) -> Path:
     return VoiceStore().model(safe_voice(voice))
 
 
-def synthesize_file(request_path: Path, output_path: Path) -> None:
-    """Child-only entry point: bounded synthesis with no UI or playback."""
-    if request_path.stat().st_size > 16 * 1024:
-        raise ValueError("Speech request is too large")
-    request = json.loads(request_path.read_text(encoding="utf-8"))
+def validate_speech_request(request):
     if (not isinstance(request, dict) or not isinstance(request.get("voice"), str)
             or request["voice"] not in VOICES):
         raise ValueError("Invalid speech voice")
     text = request.get("text")
     if not isinstance(text, str) or not text.strip() or len(text) > MAX_TEXT + 150:
         raise ValueError("Invalid speech request")
+    return request["voice"], text
+
+
+def load_voice(voice):
     from piper import PiperVoice
     from piper.config import PiperConfig
     import onnxruntime
-    model = model_path(request["voice"])
+    model = model_path(voice)
     options = onnxruntime.SessionOptions()
     options.intra_op_num_threads = 2
     options.inter_op_num_threads = 1
@@ -67,6 +78,10 @@ def synthesize_file(request_path: Path, output_path: Path) -> None:
         session=onnxruntime.InferenceSession(str(model), sess_options=options,
                                           providers=["CPUExecutionProvider"]))
     voice.use_tashkeel = False  # No optional language-resource downloads.
+    return voice
+
+
+def write_speech(voice, text, output_path):
     frames = 0
     with wave.open(str(output_path), "wb") as output:
         for chunk in voice.synthesize(text):
@@ -83,16 +98,21 @@ def synthesize_file(request_path: Path, output_path: Path) -> None:
     inspect_wav(output_path)
 
 
+def synthesize_file(request_path: Path, output_path: Path) -> None:
+    """Child-only entry point: bounded synthesis with no UI or playback."""
+    if request_path.stat().st_size > 16 * 1024:
+        raise ValueError("Speech request is too large")
+    voice, text = validate_speech_request(json.loads(request_path.read_text(encoding="utf-8")))
+    write_speech(load_voice(voice), text, output_path)
+
+
 def synthesize_hidden(text: str, output: Path, cancelled: threading.Event, voice=DEFAULT_VOICE) -> bool:
     request = output.with_suffix(".json")
     request.write_text(json.dumps({"text": text, "voice": safe_voice(voice)}, ensure_ascii=False), encoding="utf-8")
-    command = [sys.executable]
-    if not getattr(sys, "frozen", False):
-        command.append(str(Path(__file__).with_name("sls_mass_notify.py")))
-    command.extend(["--synthesize-announcement", str(request), str(output)])
+    command, environment = speech_command("--synthesize-announcement", request, output)
     process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                stderr=subprocess.DEVNULL,
-                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), env=environment)
     deadline = time.monotonic() + SYNTHESIS_TIMEOUT
     try:
         while process.poll() is None:
@@ -124,16 +144,18 @@ class AudioJob:
     speech_enabled: bool | None = None
     tone_enabled: bool = True
     queued_at: float = 0.0
+    deadline: float | None = None
 
 
 class NotificationAudio:
     """Serialize tones and speech; higher priority alerts interrupt immediately."""
     def __init__(self, *, tone, stop, on_error, on_success=None, on_activity=None, enabled=True, voice=DEFAULT_VOICE,
-                 synthesize=synthesize_hidden, play=None, resolve_voice=playback_voice):
+                 synthesize=None, play=None, resolve_voice=playback_voice):
         self._tone, self._stop, self._on_error = tone, stop, on_error
         self._on_success = on_success
         self._on_activity = on_activity
-        self._synthesize, self._play = synthesize, play
+        self._worker = PiperWorker() if synthesize is None else None
+        self._synthesize, self._play = (self._worker.synthesize if self._worker else synthesize), play
         self._resolve_voice = resolve_voice
         self._enabled = bool(enabled)
         self._voice = safe_voice(voice)
@@ -144,6 +166,8 @@ class NotificationAudio:
         self._closed = False
         self._thread = threading.Thread(target=self._run, name="NotificationAudio", daemon=True)
         self._thread.start()
+        if self._worker and self._enabled:
+            self._worker.prewarm(self._voice)
 
     def _halt(self):
         try:
@@ -167,6 +191,9 @@ class NotificationAudio:
             job = AudioJob(record_id, alert, priority, expires, threading.Event(),
                            safe_voice(voice) if voice is not None else None,
                            speech_enabled, tone_enabled, time.monotonic())
+            job.tone_enabled = tone_enabled and wants_beep(field(alert, "beep", True))
+            if expires is not None:
+                job.deadline = time.monotonic() + max(0, expires - time.time())
             self._pending.append(job)
             self._pending.sort(key=lambda j: j.priority)  # Stable FIFO per priority.
             self._condition.notify()
@@ -185,16 +212,21 @@ class NotificationAudio:
             if not enabled and self._active:
                 self._active.cancelled.set()
                 self._halt()
+        if self._worker and enabled:
+            self._worker.prewarm(safe_voice(voice))
 
     def close(self):
         with self._condition:
             self._closed = True
             self.cancel()
             self._condition.notify()
+        if self._worker:
+            self._worker.close()
 
     @staticmethod
     def _valid(job):
-        if job.expires is not None and job.expires <= time.time():
+        if ((job.expires is not None and job.expires <= time.time())
+                or (job.deadline is not None and job.deadline <= time.monotonic())):
             job.cancelled.set()
         return not job.cancelled.is_set()
 
@@ -267,7 +299,7 @@ class NotificationAudio:
                 failed = True
                 # Never log message text or pass it to an external service.
                 self._activity(job, "failed:" + type(exc).__name__)
-                self._on_error("Announcement audio could not play. Read the notification on screen.")
+                self._on_error("Notification speech could not play. Read the notification on screen.")
                 self._wait(job, max(0, tone_finished - time.monotonic()))
             finally:
                 with self._condition:
@@ -279,3 +311,5 @@ class NotificationAudio:
                     elif preparing:
                         self._activity(job, "cancelled")
                     self._active = None
+                if self._worker and self._enabled and not self._closed:
+                    self._worker.prewarm(self._voice)

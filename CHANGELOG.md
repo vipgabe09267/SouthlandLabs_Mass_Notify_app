@@ -1,5 +1,31 @@
 # Changelog
 
+## 1.0.13-beta - 2026-10-25
+
+- Restore always-on-top display for regular announcements as well as urgent alerts. Show the priority as `URGENT` or `Regular` on plain and image-backed notifications, retaining a separate test marker and existing dismissal/expiry rules. Verify native Windows z-order against a normal application raised afterward.
+- Read received weather alerts as well as announcements. Prioritize weather instructions, retain explicit test markers, and read image-only headings with a prompt to view the notification. The existing speech toggle controls both categories.
+- Warm one hidden Piper worker when speech is enabled and reuse its loaded voice between messages. Remove repeated interpreter/model startup delays, retain voice selection and fallback, and stop or restart the worker on cancellation, failure, timeout, or app shutdown. No notification text leaves the device.
+- Verify speech through the actual received-payload, durable inbox, presentation and audio paths for an announcement and weather alert, plus a local preview. Require all three to finish through intercepted playback using the same warmed process; record synthesis timings without message text.
+- Update the bundled runtime to Python 3.14.9 with OpenSSL 3.5.9. Update Pillow to 13.0.0, setuptools to 84.2.1, and pip to 26.2.2, retaining reviewed hashes and checking current dependency advisories.
+- Restrict downloaded notification images to PNG, JPEG, GIF, and WebP. Keep dimension, pixel-count, and download limits and show the text fallback for unsupported or damaged images.
+- Keep the notification dispatcher running after a transient local storage failure. Reject incident responses from retained windows after enrollment replacement, including replies that arrive after replacement.
+- Preserve the original incident notification in History while its explicit human response is unconfirmed, so retention cleanup cannot remove the only route to retry the saved request. Resume normal retention after confirmation and keep this protection scoped to the original enrollment.
+- Prevent malformed JSON and oversized SSE retry values from interrupting later valid events. Require real heartbeat or notification activity to keep a stream alive; blank padding cannot hide a stalled connection.
+- Interrupt optional voice downloads promptly on cancellation and enforce absolute header and total download deadlines, including servers that trickle bytes without triggering socket timeouts.
+- Add a private Windows desktop runner for native setup, layout, image, and delivery checks. It never switches the input desktop, contains each fixture's child processes, and writes failures to local build logs.
+- Negotiate transport through an authenticated polling baseline. Honor the PBX's documented polling/SSE preference and polling interval; retain capabilities when unchanged replies omit them. Keep PHP-FPM on healthy polling, respect the stream's retry deadline, and accept polling in connection tests without requiring an SSE slot.
+- Drain every page of a live polling burst using the server's opaque cursor. Establish an explicitly empty baseline after startup or disconnection, skip retained history on cursor gaps, and detect nonadvancing pagination. Keep unchanged responses from replaying `latest` or clearing delivery state.
+- Reduce polling page size when a batch exceeds the 1 MiB response limit, retrying the same cursor without treating the connected session as a new baseline. Keep the size limit and stop if even a single-event page exceeds it.
+- Fence late polling and receipt replies after account, credential, enrollment, or connection changes. Bind local delivery records to the PBX's reported enrollment identity without transferring another enrollment's receipts.
+- Continue the current cursor during an explicitly requested healthy SSE renewal. Keep fresh live baselines for actual disconnections and cursor resets.
+- Accept null display timeouts and optional expiry timestamps. Apply the earliest original deadline consistently to storage, presentation, and audio; enforce the ten-minute announcement cap even with timeout zero. Retain monotonic deadlines for active popups and audio.
+- Honor numeric and HTTP-date Retry-After values for rate limits and service outages. Bound saved receipt retries, process receipt batches, and retain terminal rejections for administrator review. Never invent a published event ID for an acknowledgement.
+- Preserve weather instructions and message type, give explicit `is_test` precedence over legacy test metadata, and respect `beep: no` without disabling independently configured announcement speech.
+- Show the configured PBX name on alerts and in notification history. Keep written descriptions and instructions in Details, and expose server clock differences in Health.
+- Add per-PBX **🧪 Labs** support for authenticated event images, off by default. Restrict credentials to that enrollment's exact HTTPS origin, port, media path, and event ID; block authenticated redirects and enforce the 5 MiB image limit.
+- Support the server's 2,048-byte UTF-8 event identifiers without rewriting them. Preserve Unicode cursors on polling and streaming requests, keep receipt JSON below the request limit, and allow bounded escaped receipt confirmations. Accept larger nonnegative server display timeouts while retaining the desktop's ten-minute cap.
+- Add private compatibility fixtures for transport negotiation, polling-to-SSE handoff, bursts, live baselines, stale responses, enrollment replacement, exact-event receipts, expiry, sound instructions, and image credential isolation.
+
 ## 1.0.12-beta - 2026-10-17
 
 - Bundle only Lessac low in the installer. Offer seven optional voice downloads in Settings, with progress, cancellation, pinned HTTPS sources, exact-size and SHA-256 checks, and per-user storage preserved across app upgrades. Keep announcements working with Lessac when an optional voice is missing; test downloaded Amy through the packaged synthesizer.

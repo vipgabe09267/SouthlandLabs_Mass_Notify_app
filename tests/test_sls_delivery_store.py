@@ -22,6 +22,21 @@ class InboxTests(unittest.TestCase):
     def tearDown(self):
         self.inbox.close()
 
+    def test_retention_preserves_history_needed_to_retry_unconfirmed_human_response(self):
+        identifier = "inc_" + "a" * 32
+        payload = {"body": "Incident instructions", "response_incident_id": identifier}
+        with mock.patch("sls_store.time.time", return_value=1):
+            original, _ = self.inbox.receive("original-enrollment", "old-incident", payload, state="expired")
+            unrelated, _ = self.inbox.receive("replacement-enrollment", "old-incident", payload, state="expired")
+            request = self.inbox.begin_human_response("original-enrollment", identifier, "safe")
+        self.assertEqual(self.inbox.prune(), 1)
+        self.assertIsNotNone(self.inbox.record(original))
+        self.assertIsNone(self.inbox.record(unrelated))
+        self.assertEqual(self.inbox.pending_human_response("original-enrollment", identifier), request)
+        self.inbox.confirm_human_response(request["request_id"])
+        self.assertEqual(self.inbox.prune(), 1)
+        self.assertIsNone(self.inbox.record(original))
+
     def test_receipt_survives_restart_before_presentation(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "inbox.db"
@@ -88,11 +103,11 @@ class InboxTests(unittest.TestCase):
         with mock.patch("sls_store.time.time", return_value=3001):
             self.assertEqual([], self.inbox.pending())
 
-    def test_zero_timeout_ignores_stale_announcement_deadline(self):
+    def test_zero_timeout_respects_absolute_announcement_deadline(self):
         with mock.patch("sls_store.time.time", return_value=1000):
             self.inbox.receive("one", "persist", {"kind": "announcement", "display_timeout_seconds": 0, "display_expires_at": iso(10)})
             expired, _ = self.inbox.receive("one", "stale", {"kind": "announcement", "display_timeout_seconds": 30, "display_expires_at": iso(10)})
-            self.assertEqual("persist", self.inbox.pending()[0]["event_id"])
+            self.assertEqual([], self.inbox.pending())
             self.assertEqual("expired", self.inbox.record(expired)["state"])
 
     def test_incident_revision_terminal_state_and_stale_callbacks(self):
@@ -210,10 +225,11 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(events, ordered_reconciliation({"events": events, "latest": events[-1]}, "latest"))
         self.assertEqual(events, ordered_reconciliation({"events": list(reversed(events)), "order": "descending"}))
 
-    def test_reconciliation_includes_new_revision_and_explicit_sequence(self):
+    def test_reconciliation_uses_events_array_without_appending_latest(self):
         events = [{"id": "a", "revision": 1, "sequence": 1}, {"id": "b", "sequence": 2}]
         latest = {"id": "a", "revision": 2, "sequence": 3}
-        self.assertEqual([1, 2, 3], [item["sequence"] for item in ordered_reconciliation({"events": list(reversed(events)), "latest": latest})])
+        self.assertEqual([1, 2], [item["sequence"] for item in ordered_reconciliation({"events": list(reversed(events)), "latest": latest})])
+        self.assertEqual([latest], ordered_reconciliation({"latest": latest}))
 
     def test_schema_bounds_and_boolean_contract(self):
         invalid = [{"schema_version": True}, {"test_only": "false"}, {"is_test": 1}, {"message": "a" * 131073},
@@ -222,8 +238,8 @@ class ProtocolTests(unittest.TestCase):
         for payload in invalid:
             with self.subTest(payload=list(payload)), self.assertRaises(ValueError):
                 validate_payload(payload)
-        self.assertEqual({"display_timeout_seconds": 0, "display_expires_at": "obsolete"},
-                         validate_payload({"display_timeout_seconds": 0, "display_expires_at": "obsolete"}))
+        with self.assertRaises(ValueError):
+            validate_payload({"display_timeout_seconds": 0, "display_expires_at": "obsolete"})
         self.assertEqual("", validate_payload({"severity": None})["severity"])
 
     def test_explicit_test_fields_only_and_header_safe_ids(self):
@@ -232,7 +248,7 @@ class ProtocolTests(unittest.TestCase):
         self.assertFalse(is_test({"message": "The word test does not classify this alert"}))
         value = "urn:oid:https://alerts.weather.gov/cap?event=a%2Fb&v=1"
         self.assertEqual(value, validate_id(value))
-        for invalid in ("abc\r\nHeader: x", "abc\x00", "a" * 1025):
+        for invalid in ("abc\r\nHeader: x", "abc\x00", "a" * 2049):
             with self.assertRaises(ValueError):
                 validate_id(invalid)
         with self.assertRaises(ValueError):

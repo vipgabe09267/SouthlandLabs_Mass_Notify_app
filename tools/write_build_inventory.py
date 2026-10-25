@@ -17,8 +17,8 @@ def main():
     openssl_match = re.match(r"OpenSSL (\d+)\.(\d+)\.(\d+)", ssl.OPENSSL_VERSION)
     openssl_version = tuple(map(int, openssl_match.groups())) if openssl_match else (0, 0, 0)
     inventory = {"application_version": VERSION, "python": platform.python_version(), "openssl": ssl.OPENSSL_VERSION,
-                 "runtime_security_warning": ("Development runtime only: OpenSSL 3.5.8 security fixes are not included. Production release is blocked pending a reviewed patched runtime."
-                                              if openssl_version < (3, 5, 8) else ""),
+                 "runtime_security_warning": ("OpenSSL 3.5.9 security fixes are not included. Build and release validation require a reviewed patched runtime."
+                                              if openssl_version < (3, 5, 9) else ""),
                  "native_advisory_source": "https://openssl-library.org/news/openssl-3.5-notes/",
                  "platform": platform.platform(), "packages": sorted(
                      ({"name": entry.metadata["Name"], "version": entry.version} for entry in importlib.metadata.distributions()),

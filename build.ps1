@@ -17,7 +17,7 @@ if ($Headless -and $Release) { throw 'Production release validation requires des
 if (-not $PythonExecutable) {
     $launcher = (Get-Command py.exe -ErrorAction Stop).Source
     $PythonExecutable = (& $launcher -3.14 -c 'import sys; print(sys.executable)')
-    if ($LASTEXITCODE -ne 0) { throw 'CPython 3.14.7 is required; install it explicitly before building.' }
+    if ($LASTEXITCODE -ne 0) { throw 'CPython 3.14.9 is required; install it explicitly before building.' }
     $PythonExecutable = $PythonExecutable.Trim()
 }
 if (-not [IO.Path]::IsPathRooted($PythonExecutable)) { throw 'PythonExecutable must be an absolute path.' }

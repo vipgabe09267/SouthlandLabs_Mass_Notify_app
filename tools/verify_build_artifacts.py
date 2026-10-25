@@ -3,6 +3,7 @@ import hashlib
 import json
 import marshal
 import os
+import re
 import ssl
 import sys
 import subprocess
@@ -35,10 +36,36 @@ def digest(path):
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
+def verify_locked_packages(packages):
+    """Reject provenance from a stale or contaminated build environment."""
+    canonical = lambda name: re.sub(r"[-_.]+", "-", name).lower()
+    expected = {}
+    for line in (ROOT / "requirements-build.txt").read_text(encoding="utf-8").splitlines():
+        match = re.match(r"([A-Za-z0-9_-]+)==([^ ]+)", line)
+        if match:
+            expected[canonical(match[1])] = match[2]
+    actual = {canonical(item["name"]): item["version"] for item in packages}
+    if not expected or len(actual) != len(packages) or actual != expected:
+        raise ValueError("Build inventory packages differ from the reviewed dependency lock")
+
+
+def verify_runtime_binaries(directory, *, include_sqlite=True):
+    base = Path(sys.base_prefix)
+    sources = {"python314.dll": base / "python314.dll"}
+    names = ["_ssl.pyd", "libssl-3.dll", "libcrypto-3.dll"]
+    if include_sqlite:
+        names.extend(("_sqlite3.pyd", "sqlite3.dll"))
+    sources.update({name: base / "DLLs" / name for name in names})
+    for name, source in sources.items():
+        if digest(directory / "_internal" / name) != digest(source):
+            raise ValueError(f"Packaged {name} differs from the checked build interpreter")
+
+
 def verify(directory, main):
     inventory = json.loads((directory / "build-inventory.json").read_text(encoding="utf-8"))
-    if inventory["application_version"] != VERSION or inventory["python"] != "3.14.7" or inventory["openssl"] != ssl.OPENSSL_VERSION:
+    if inventory["application_version"] != VERSION or inventory["python"] != "3.14.9" or inventory["openssl"] != ssl.OPENSSL_VERSION:
         raise SystemExit(f"Unexpected runtime or application version in {directory}")
+    verify_locked_packages(inventory["packages"])
     expected = {item["path"] for item in inventory["files"]}
     # Nested application inventories are already covered as files in the installer
     # inventory; exclude only the inventory for the current root.
@@ -70,9 +97,7 @@ def verify(directory, main):
             source = compile((ROOT / "src" / f"{name}.py").read_bytes(), str(ROOT / "src" / f"{name}.py"), "exec", optimize=0)
             if not code_equal(modules.extract(name), source):
                 raise SystemExit(f"Packaged module differs from current source: {name}")
-    base_dll = Path(sys.base_prefix) / "python314.dll"
-    if digest(directory / "_internal" / "python314.dll") != digest(base_dll):
-        raise SystemExit("Packaged Python DLL differs from the checked build interpreter")
+    verify_runtime_binaries(directory, include_sqlite=main == "sls_mass_notify")
     return executable
 
 
@@ -102,12 +127,13 @@ def main():
     with tempfile.TemporaryDirectory(prefix="sls-audio-validation-") as temporary:
         report_path = Path(temporary) / "audio.json"
         subprocess.run([str(application), "--check-announcement-audio", str(report_path)],
-                       timeout=60, check=True, creationflags=subprocess.CREATE_NO_WINDOW)
+                       timeout=105, check=True, creationflags=subprocess.CREATE_NO_WINDOW)
         report = json.loads(report_path.read_text(encoding="utf-8"))
-        if report.get("voice_playback_calls") != 2:
-            raise SystemExit("Packaged announcement audio did not reach both intercepted playback calls")
-        print("Verified packaged local preview and announcement through presenter, audio queue, "
-              "child synthesis, non-silent PCM, and intercepted Windows playback; no windows or sound.")
+        if (report.get("voice_playback_calls") != 3 or report.get("received_records") != 2
+                or report.get("reused_worker") is not True):
+            raise SystemExit("Packaged preview, received announcement and weather speech did not pass")
+        print("Verified packaged preview, received announcement and weather alert through durable inbox, presenter, "
+              "audio queue and one warm Piper process; non-silent PCM with Windows playback intercepted.")
     headless = "--headless" in sys.argv
     if not headless:
         subprocess.run([str(application), "--check-presentation"], timeout=15,
@@ -133,7 +159,7 @@ def main():
     expected_report = f"SLS_PACKAGE_OK {VERSION} {digest(ROOT / 'build' / 'setup-payload.zip')} {source_digest()}"
     if report.stdout.strip() != expected_report:
         raise SystemExit(f"Bootstrap embedded package verification failed: {report.stdout!r}")
-    print(f"Verified app and self-contained installer: version {VERSION}, Python 3.14.7, {ssl.OPENSSL_VERSION}; inventories, source bytecode, identical app payload, and bootstrap package self-check.")
+    print(f"Verified app and self-contained installer: version {VERSION}, Python 3.14.9, {ssl.OPENSSL_VERSION}; inventories, source bytecode, identical app payload, and bootstrap package self-check.")
     if headless:
         print("Headless validation: no windows were displayed. Setup construction was checked with its window withdrawn; interactive desktop smoke checks remain outstanding.")
 

@@ -34,12 +34,24 @@ class TextTests(unittest.TestCase):
         for value in ("../../model", None, "en_US-lessac-low.onnx", {}, False):
             self.assertEqual(speech.safe_voice(value), speech.DEFAULT_VOICE)
 
-    def test_read_normalized_announcements_only(self):
+    def test_read_normalized_notifications_without_raw_payload_or_image_urls(self):
         self.assertEqual(speech.announcement_text(announcement()), "Announcement. Check the lobby.")
-        self.assertEqual(speech.announcement_text(dict(kind="alert", body="Weather alert")), "")
-        self.assertEqual(speech.announcement_text(announcement("", image_url="https://example.invalid/raw.xml")), "")
+        self.assertEqual(speech.announcement_text(dict(kind="alert", body="Weather alert")), "Weather alert")
+        self.assertEqual(speech.announcement_text(announcement("", image_url="https://example.invalid/raw.xml")),
+                         "Announcement. Read the notification on screen.")
         self.assertNotIn("[[", speech.announcement_text(announcement("[[injected]]\0 message")))
         self.assertNotIn("\0", speech.announcement_text(announcement("\0 message")))
+
+    def test_weather_instructions_precede_long_description_and_test_marker_is_explicit(self):
+        result = speech.announcement_text(dict(kind="alert", title="Tornado warning",
+            description="A long weather description. " * 150, instructions="Take shelter now.",
+            raw={"is_test": True, "xml": "PRIVATE RAW PAYLOAD"}))
+        self.assertTrue(result.startswith("Test alert. Tornado warning. Take shelter now."))
+        self.assertNotIn("PRIVATE RAW", result)
+        self.assertLessEqual(len(result), speech.MAX_TEXT + 150)
+
+    def test_identical_title_and_body_are_not_repeated(self):
+        self.assertEqual(speech.announcement_text(announcement("Announcement")), "Announcement")
 
     def test_explicit_tests_are_announced_without_guessing_from_wording(self):
         self.assertTrue(speech.announcement_text(announcement(raw={"is_test": True})).startswith("Test announcement."))
@@ -234,19 +246,26 @@ class QueueTests(unittest.TestCase):
         self.assertEqual(len(self.tones), 1)
         self.stop.assert_called()
 
-    def test_critical_weather_interrupts_speech_without_reading_weather_raw_text(self):
+    def test_critical_weather_interrupts_and_reads_normalized_alert_text(self):
         started = threading.Event()
+        calls = []
         def synth(text, path, cancelled, voice):
-            started.set()
-            self.assertTrue(cancelled.wait(2))
-            return False
+            calls.append(text)
+            if len(calls) == 1:
+                started.set()
+                self.assertTrue(cancelled.wait(2))
+                return False
+            return self.synth(text, path, cancelled, voice)
         audio = self.make(synthesize=synth)
         audio.submit("announcement", announcement(), 3)
         self.assertTrue(started.wait(2))
-        audio.submit("critical", {"kind": "alert", "body": "Weather raw text"}, 0)
+        audio.submit("critical", {"kind": "alert", "title": "Tornado warning", "body": "Take shelter.",
+                                  "raw": {"xml": "PRIVATE RAW PAYLOAD"}}, 0)
         self.idle()
         self.assertEqual(len(self.tones), 2)
-        self.assertFalse(self.played)
+        self.assertEqual(len(self.played), 1)
+        self.assertEqual(calls[-1], "Tornado warning. Take shelter.")
+        self.assertNotIn("PRIVATE RAW", calls[-1])
 
     def test_synthesis_failure_keeps_worker_alive_for_next_notification(self):
         calls = []

@@ -51,7 +51,8 @@ class IsolatedClientTest(unittest.TestCase):
         self.enterContext(mock.patch.object(client, "_write_windows_credential", side_effect=AssertionError("Unexpected real credential write")))
         self.enterContext(mock.patch.object(client, "_delete_windows_credential", side_effect=AssertionError("Unexpected real credential deletion")))
         self.profile = client.normalize_endpoint(dict(endpoint="https://pbx.example.test", username="desktop-1",
-                                                       password="old password", enabled=True), 0)
+                                                       password="old password", enabled=True,
+                                                       desktop_client_id="desktop-1"), 0)
         self.instance = client.MassNotifyApp.__new__(client.MassNotifyApp)
         self.instance.notification_audio = mock.Mock()
         self.instance.voice_downloads = mock.Mock()
@@ -207,12 +208,12 @@ class DurableDeliveryIntegrationTests(IsolatedClientTest):
         self.instance.presenter.submit.assert_not_called()
         self.assertEqual(self.instance.inbox.statistics(), {"expired": 2, "pending_receipts": 2})
 
-    def test_announcement_zero_timeout_is_not_expired_by_stale_display_deadline(self):
+    def test_announcement_zero_timeout_respects_absolute_display_deadline(self):
         self.instance.accept_alert(0, self.alert(kind="announcement", severity="notice",
             display_timeout_seconds=0, display_expires_at="2000-01-01T00:00:00Z"))
         self.instance.pump_inbox()
-        self.instance.presenter.submit.assert_called_once()
-        self.assertEqual(self.instance.inbox.statistics(), {"pending": 1, "pending_receipts": 1})
+        self.instance.presenter.submit.assert_not_called()
+        self.assertEqual(self.instance.inbox.statistics(), {"expired": 1, "pending_receipts": 1})
 
     def test_explicit_test_metadata_survives_compact_durable_payload_roundtrip(self):
         for index, metadata in enumerate(({"test_only": True}, {"is_test": True},

@@ -13,9 +13,82 @@ from sls_presentation import PendingAlert, _AlertView, presentation_policy
 from sls_windowing import apply_window_icon
 
 
+def assert_notification_overlay(window):
+    """Check native topmost state and z-order above a newly raised normal app."""
+    if os.name != "nt":
+        return
+    import ctypes
+    from ctypes import wintypes
+    user = ctypes.WinDLL("user32", use_last_error=True)
+    user.GetAncestor.argtypes, user.GetAncestor.restype = [wintypes.HWND, wintypes.UINT], wintypes.HWND
+    user.GetWindowLongPtrW.argtypes, user.GetWindowLongPtrW.restype = [wintypes.HWND, ctypes.c_int], ctypes.c_ssize_t
+    handle = user.GetAncestor(window.winfo_id(), 2)
+    assert user.GetWindowLongPtrW(handle, -20) & 0x8, "Notification lacks native always-on-top state"
+    user.CreateWindowExW.argtypes = [wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD,
+        ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, wintypes.HWND, wintypes.HMENU,
+        wintypes.HINSTANCE, ctypes.c_void_p]
+    user.CreateWindowExW.restype = wintypes.HWND
+    user.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
+                                  ctypes.c_int, ctypes.c_int, wintypes.UINT]
+    user.GetTopWindow.argtypes, user.GetTopWindow.restype = [wintypes.HWND], wintypes.HWND
+    user.GetWindow.argtypes, user.GetWindow.restype = [wintypes.HWND, wintypes.UINT], wintypes.HWND
+    user.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+    user.DestroyWindow.argtypes = [wintypes.HWND]
+    other = user.CreateWindowExW(0x08000000, "STATIC", "Normal application fixture", 0x10CF0000,
+                                 40, 40, 700, 500, None, None, None, None)
+    if not other:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        # Raise a normal top-level window after the notification was displayed.
+        # NOACTIVATE avoids changing input focus, even on the private desktop.
+        for state in (1, 3):  # Normal and maximized application windows.
+            user.ShowWindow(other, state)
+            if not user.SetWindowPos(other, None, 0, 0, 0, 0, 0x1 | 0x2 | 0x10):
+                raise ctypes.WinError(ctypes.get_last_error())
+            order = {}
+            current = user.GetTopWindow(None)
+            for index in range(1000):
+                if not current:
+                    break
+                if current in (handle, other):
+                    order[current] = index
+                current = user.GetWindow(current, 2)
+            assert handle in order and other in order, "Native overlay windows are missing from z-order"
+            assert order[handle] < order[other], "A normal or maximized application covered the notification"
+    finally:
+        user.DestroyWindow(other)
+
+
 def check_presentation(configure_style):
     for kind in ("announcement", "alert"):
         _check_visual_notification(configure_style, kind)
+        _check_regular_text_notification(configure_style, kind)
+
+
+def _check_regular_text_notification(configure_style, kind):
+    root = tk.Tk()
+    root.withdraw()
+    configure_style(SimpleNamespace(window=root))
+    view = None
+    responses = []
+    try:
+        presenter = SimpleNamespace(root=root, image_loader=None,
+            _respond=lambda *args: responses.append(args), show_history=lambda: None)
+        alert = dict(kind=kind, title="Regular notification", body="Fixture instructions", priority="notice")
+        policy = presentation_policy(alert)
+        assert not policy.persistent, "Overlay must not change regular dismissal policy"
+        view = _AlertView(presenter, PendingAlert("plain-fixture", alert, 0, policy), 0)
+        view.window.attributes("-alpha", 0.0)
+        root.update()
+        assert_notification_overlay(view.window)
+        assert view.urgency_label.cget("text") == "Regular"
+        assert view.ack.cget("text") == "Dismiss"
+        view.ack.invoke()
+        assert responses == [("plain-fixture", "dismissed")]
+    finally:
+        if view is not None:
+            view.close()
+        root.destroy()
 
 
 def _check_visual_notification(configure_style, kind):
@@ -44,6 +117,8 @@ def _check_visual_notification(configure_style, kind):
         view = _AlertView(presenter, PendingAlert("fixture", alert, 0, presentation_policy(alert)), 0)
         view.window.attributes("-alpha", 0.0)
         root.update()
+        assert_notification_overlay(view.window)
+        assert view.urgency_label.cget("text") == ("URGENT" if kind == "alert" else "Regular")
         assert view.instructions.winfo_ismapped(), "Initial text fallback is hidden"
         deadline = time.monotonic() + 5
 

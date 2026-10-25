@@ -11,7 +11,7 @@ import threading
 import time
 from pathlib import Path
 
-from sls_protocol import timestamp, validate_id, notification_priority
+from sls_protocol import timestamp, validate_id, notification_priority, notification_expiry
 
 
 class InboxFullError(RuntimeError):
@@ -23,18 +23,7 @@ def _priority(payload: dict) -> int:
 
 
 def _times(payload: dict) -> tuple[float | None, float | None]:
-    effective, expires = timestamp(payload.get("effective")), timestamp(payload.get("expires"))
-    if str(payload.get("kind", "")).lower() == "announcement":
-        if payload.get("display_timeout_seconds") == 0:
-            expires = None
-        elif payload.get("display_timeout_seconds") is not None:
-            expires = timestamp(payload.get("display_expires_at"))
-        elif payload.get("display_expires_at"):
-            expires = timestamp(payload["display_expires_at"])
-    delivery_expires = timestamp(payload.get("delivery_expires_at"))
-    if delivery_expires is not None:
-        expires = min(expires, delivery_expires) if expires is not None else delivery_expires
-    return effective, expires
+    return timestamp(payload.get("effective")), notification_expiry(payload)
 
 
 class Inbox:
@@ -98,6 +87,9 @@ class Inbox:
                 attempts INTEGER NOT NULL DEFAULT 0,retry_after REAL NOT NULL DEFAULT 0,
                 error TEXT NOT NULL DEFAULT '',UNIQUE(namespace,event_id))""")
             self.db.execute("CREATE INDEX IF NOT EXISTS receipts_to_send ON receipt_outbox(namespace,sent,retry_after)")
+            receipt_columns = {row[1] for row in self.db.execute("PRAGMA table_info(receipt_outbox)")}
+            if "terminal" not in receipt_columns:
+                self.db.execute("ALTER TABLE receipt_outbox ADD COLUMN terminal INTEGER NOT NULL DEFAULT 0")
             # Additive table: old clients leave this data intact. Deliberate
             # human-response retries are separate from the automatic ACK outbox.
             self.db.execute("""CREATE TABLE IF NOT EXISTS human_response_requests (
@@ -187,6 +179,9 @@ class Inbox:
                 self.db.execute("INSERT INTO receipts VALUES(?,?,?,?,?)", (record_id, namespace, event_id, revision, now))
             if receipt_event_id:
                 receipt_id = hashlib.sha256(json.dumps([namespace, receipt_event_id]).encode()).hexdigest()
+                if (not self.db.execute("SELECT 1 FROM receipt_outbox WHERE receipt_id=?", (receipt_id,)).fetchone()
+                        and self.db.execute("SELECT COUNT(*) FROM receipt_outbox WHERE sent IS NULL AND terminal=0").fetchone()[0] >= self.max_pending):
+                    raise InboxFullError("Receipt queue is full; pending receipts were retained")
                 self.db.execute("INSERT OR IGNORE INTO receipt_outbox(receipt_id,namespace,event_id,created) VALUES(?,?,?,?)",
                                 (receipt_id, namespace, receipt_event_id, now))
             # Opaque SSE IDs are ordered by the single live reader, never by event
@@ -198,7 +193,7 @@ class Inbox:
 
     def pending_receipts(self, namespace: str, *, limit: int = 16) -> list[dict]:
         with self.lock:
-            rows = self.db.execute("""SELECT * FROM receipt_outbox WHERE namespace=? AND sent IS NULL
+            rows = self.db.execute("""SELECT * FROM receipt_outbox WHERE namespace=? AND sent IS NULL AND terminal=0
                 AND retry_after<=? ORDER BY created,receipt_id LIMIT ?""", (namespace, time.time(), max(1, min(limit, 256)))).fetchall()
         return [dict(row) for row in rows]
 
@@ -206,14 +201,19 @@ class Inbox:
         with self._transaction():
             self.db.execute("UPDATE receipt_outbox SET sent=COALESCE(sent,?),error='' WHERE receipt_id=?", (time.time(), receipt_id))
 
-    def receipt_failed(self, receipt_id: str, error: str = "") -> None:
+    def receipt_failed(self, receipt_id: str, error: str = "", *, retry_after: float = 0) -> None:
         with self._transaction():
             row = self.db.execute("SELECT attempts FROM receipt_outbox WHERE receipt_id=? AND sent IS NULL", (receipt_id,)).fetchone()
             if row is None:
                 return
             attempts = row[0] + 1
             self.db.execute("UPDATE receipt_outbox SET attempts=?,retry_after=?,error=? WHERE receipt_id=?",
-                            (attempts, time.time() + min(300, 2 ** min(attempts, 9)), str(error)[:500], receipt_id))
+                            (attempts, time.time() + max(retry_after, min(300, 2 ** min(attempts, 9))), str(error)[:500], receipt_id))
+
+    def receipt_rejected(self, receipt_id: str, error: str) -> None:
+        with self._transaction():
+            self.db.execute("UPDATE receipt_outbox SET terminal=1,error=? WHERE receipt_id=? AND sent IS NULL",
+                            (str(error)[:500], receipt_id))
 
     def cursor(self, namespace: str) -> str:
         with self.lock:
@@ -397,7 +397,10 @@ class Inbox:
     def statistics(self) -> dict:
         with self.lock:
             counts = dict(self.db.execute("SELECT state,COUNT(*) FROM notifications GROUP BY state").fetchall())
-            counts["pending_receipts"] = self.db.execute("SELECT COUNT(*) FROM receipt_outbox WHERE sent IS NULL").fetchone()[0]
+            counts["pending_receipts"] = self.db.execute("SELECT COUNT(*) FROM receipt_outbox WHERE sent IS NULL AND terminal=0").fetchone()[0]
+            rejected_receipts = self.db.execute("SELECT COUNT(*) FROM receipt_outbox WHERE terminal=1 AND sent IS NULL").fetchone()[0]
+            if rejected_receipts:
+                counts["rejected_receipts"] = rejected_receipts
             rejected = self.db.execute("SELECT COUNT(*) FROM quarantine").fetchone()[0]
             if rejected:
                 counts["quarantined"] = rejected
@@ -413,7 +416,12 @@ class Inbox:
         with self._transaction():
             # Minimal receipts and incident high-water marks survive content retention.
             # Pending delivery and unsent responses must never be silently discarded.
-            result = self.db.execute("DELETE FROM notifications WHERE received<? AND state IN ('acknowledged','dismissed','expired','superseded','cancelled') AND record_id NOT IN (SELECT record_id FROM responses WHERE sent IS NULL)", (cutoff,))
+            result = self.db.execute("""DELETE FROM notifications WHERE received<?
+                AND state IN ('acknowledged','dismissed','expired','superseded','cancelled')
+                AND record_id NOT IN (SELECT record_id FROM responses WHERE sent IS NULL)
+                AND NOT EXISTS (SELECT 1 FROM human_response_requests AS pending
+                    WHERE pending.confirmed IS NULL AND pending.namespace=notifications.namespace
+                    AND pending.incident_id=json_extract(notifications.payload,'$.response_incident_id'))""", (cutoff,))
             self.db.execute("DELETE FROM responses WHERE sent IS NOT NULL AND record_id NOT IN (SELECT record_id FROM notifications)")
             self.db.execute("DELETE FROM receipt_outbox WHERE sent IS NOT NULL AND created<?", (cutoff,))
             self.db.execute("DELETE FROM quarantine WHERE received<?", (cutoff,))
