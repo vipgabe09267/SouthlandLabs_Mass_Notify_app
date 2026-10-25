@@ -30,10 +30,11 @@ class PollingTests(IsolatedClientTest):
     def test_expired_transport_hint_does_not_disable_sse_forever(self):
         worker = self.worker()
         worker.endpoint_cfg["live_polling_until"] = client.time.time()-1
-        with mock.patch.object(worker, "_run_live_polling") as polling, mock.patch.object(worker, "_run_live") as stream:
+        reply = {"ok": True, "events": [], "last_event_id": "@sls:empty", "has_more": False}
+        with mock.patch.object(client, "fetch_endpoint", return_value=(reply, "", client.time.time())), \
+             mock.patch.object(worker, "_run_live") as stream:
             worker.run()
-        stream.assert_called_once()
-        polling.assert_not_called()
+        stream.assert_called_once_with(initial_cursor="@sls:empty")
 
     def run_snapshots(self, snapshots):
         worker = self.worker()

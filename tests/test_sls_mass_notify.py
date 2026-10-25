@@ -80,7 +80,7 @@ class ConfigurationTests(unittest.TestCase):
             app.pbx_live_url(profile),
         )
         self.assertEqual(
-            "https://pbx.example.com/api/sipnotify/desktop?limit=100",
+            "https://pbx.example.com/api/sipnotify/desktop?limit=100&last_event_id=",
             app.pbx_recent_url(profile),
         )
 
@@ -345,7 +345,7 @@ class NetworkSecurityTests(unittest.TestCase):
         with mock.patch.object(app, "build_http_opener", return_value=opener):
             app.fetch_endpoint(app.pbx_recent_url(profile), app.endpoint_auth_headers(profile), include_server_time=True)
         request = opener.open.call_args.args[0]
-        self.assertEqual("https://pbx.example.com/api/sipnotify/desktop?limit=100", request.full_url)
+        self.assertEqual("https://pbx.example.com/api/sipnotify/desktop?limit=100&last_event_id=", request.full_url)
         self.assertEqual("Basic ZnJvbnRkZXNrOnNlY3JldA==", request.get_header("Authorization"))
         self.assertEqual(app.VERSION, request.get_header("X-sls-client-version"))
         self.assertEqual("1", request.get_header("X-sls-payload-schema"))

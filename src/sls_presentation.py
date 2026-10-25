@@ -17,7 +17,7 @@ import threading
 import time
 from typing import Any, Callable, Iterable, Mapping
 
-from sls_protocol import notification_priority
+from sls_protocol import notification_priority, notification_expiry, wants_beep
 from sls_windowing import fit_window
 
 
@@ -26,8 +26,9 @@ MAX_PENDING = 128
 MAX_HISTORY = 500
 MAX_VISIBLE = 2
 NONCRITICAL_SECONDS = 120
-MAX_IMAGE_BYTES = 8 * 1024 * 1024
+MAX_IMAGE_BYTES = 5 * 1024 * 1024
 MAX_IMAGE_PIXELS = 16_000_000
+NOTIFICATION_IMAGE_FORMATS = ("PNG", "JPEG", "GIF", "WEBP")
 
 
 def field(alert: Any, name: str, default: Any = "") -> Any:
@@ -51,6 +52,8 @@ def notification_source(alert: Any) -> Mapping[str, Any]:
 def explicit_test_mode(alert: Any) -> bool | None:
     """Never infer drills from free-text titles or instructions."""
     source = notification_source(alert)
+    if type(source.get("is_test")) is bool:
+        return source["is_test"]
     for key in ("test_only", "test", "is_test", "isTest"):
         value = source.get(key)
         if isinstance(value, bool):
@@ -131,9 +134,15 @@ def presentation_policy(alert: Any) -> PresentationPolicy:
             expires = parse_timestamp(absolute)
             if expires is None:
                 timing_warning = "The sender's expiration time is invalid. Close this notification manually."
-    delivery_expires = parse_timestamp(field(alert, "delivery_expires_at"))
-    if delivery_expires is not None:
-        expires = min(expires, delivery_expires) if expires is not None else delivery_expires
+    deadlines = {key: field(alert, key, None) or source.get(key) for key in
+                 ("kind", "created_at", "expires", "display_expires_at", "delivery_expires_at", "display_timeout_seconds")}
+    for key in ("created_at", "expires", "display_expires_at", "delivery_expires_at"):
+        parsed = parse_timestamp(deadlines[key])
+        deadlines[key] = parsed.isoformat() if parsed else None
+    absolute_expiry = notification_expiry(deadlines)
+    if absolute_expiry is not None:
+        expires = datetime.fromtimestamp(absolute_expiry, timezone.utc)
+        timeout_seconds = None
         timing_warning = ""
     return PresentationPolicy(priority, persistent, timeout_seconds, effective, expires, timing_warning)
 
@@ -169,6 +178,11 @@ class PendingAlert:
     policy: PresentationPolicy
     status: str = "pending"
     received_at: str = ""
+    deadline: float | None = None
+
+    def __post_init__(self):
+        if self.policy.expires is not None:
+            self.deadline = time.monotonic() + max(0, (self.policy.expires - datetime.now(timezone.utc)).total_seconds())
 
 
 def ordered_ready(items: Iterable[PendingAlert], now: datetime) -> list[PendingAlert]:
@@ -396,7 +410,7 @@ class AlertPresenter:
                 expires = min(expires, local_expiry) if expires else local_expiry
             self.audio_handler(item.record_id, item.alert, item.policy.priority, expires)
             return
-        if not self.play_sound:
+        if not self.play_sound or not wants_beep(field(item.alert, "beep", True)):
             return
         now = time.monotonic()
         if not should_play_audio(item.policy.priority, self._audio_priority, now, self._audio_until):
@@ -422,7 +436,8 @@ class AlertPresenter:
         try:
             now = datetime.now(timezone.utc)
             for item in list(self.pending.values()):
-                if item.policy.expires and item.policy.expires <= now:
+                if ((item.policy.expires and item.policy.expires <= now)
+                        or (item.deadline is not None and item.deadline <= time.monotonic())):
                     self._finish(item.record_id, "expired")
             ready = ordered_ready(self.pending.values(), now)
             if self.can_display is not None:
@@ -483,7 +498,8 @@ class AlertPresenter:
             for key, view in list(self.visible.items()):
                 view.poll_image()
                 policy = view.item.policy
-                if policy.expires and policy.expires <= now:
+                if ((policy.expires and policy.expires <= now)
+                        or (view.item.deadline is not None and view.item.deadline <= monotonic_now)):
                     self._finish(key, "expired")
                 elif policy.timeout_seconds and monotonic_now - view.shown_at >= policy.timeout_seconds:
                     self._finish(key, "dismissed")
@@ -547,8 +563,10 @@ class AlertPresenter:
                 response_button.configure(state="normal" if payload.get("response_incident_id") and item.get("record_id") else "disabled")
             value = "\n\n".join(part for part in (
                 text(payload.get("title")), text(item.get("status") or item.get("state")),
+                text(payload.get("source_name") or payload.get("source_endpoint")),
                 text(payload.get("timestamp") or item.get("received_at")), text(payload.get("area")),
-                text(payload.get("body") or payload.get("message") or payload.get("description"))) if part)
+                text(payload.get("body") or payload.get("message")), text(payload.get("description")),
+                text(payload.get("instructions"))) if part)
             details.configure(state="normal")
             details.delete("1.0", "end")
             details.insert("1.0", value)
@@ -560,7 +578,8 @@ class AlertPresenter:
             rows.delete(0, "end")
             for item in filtered:
                 payload = item.get("payload") if isinstance(item.get("payload"), Mapping) else item
-                rows.insert("end", f"[{item.get('status', item.get('state', 'unknown'))}] {payload.get('title', 'Notification')}")
+                name = payload.get("source_name", "")
+                rows.insert("end", f"[{item.get('status', item.get('state', 'unknown'))}] {name + ' · ' if name else ''}{payload.get('title', 'Notification')}")
             if filtered:
                 rows.selection_set(0)
                 select()
@@ -645,18 +664,24 @@ class _AlertView:
             ttk.Label(footer, textvariable=self.queue_var, wraplength=690).pack(fill="x")
             header = ttk.Frame(frame)
             header.pack(fill="x")
+            if field(item.alert, "source_name"):
+                ttk.Label(header, text="PBX: " + text(field(item.alert, "source_name")), wraplength=690).pack(fill="x", pady=(0, 8))
+            self.urgency_label = ttk.Label(header,
+                text="URGENT" if item.policy.priority <= 1 else "Regular",
+                font=("Segoe UI", 12, "bold"), wraplength=690)
+            self.urgency_label.pack(fill="x", pady=(0, 8))
             marker_label = ttk.Label(header, text=test_marker(item.alert), font=("Segoe UI", 12, "bold"), wraplength=690)
             # Server-rendered weather and announcement designs include the message.
             # Keep explicit drill identification visible; other metadata is in Details.
-            if not self.visual_notification or explicit_test_mode(item.alert) is True:
+            if explicit_test_mode(item.alert) is True:
                 marker_label.pack(fill="x", pady=(0, 8))
             title = ttk.Label(header, text=text(field(item.alert, "title")) or "Notification",
                               font=("Segoe UI", 19, "bold"), wraplength=690)
-            metadata = [text(field(item.alert, key)) for key in ("priority_label", "severity", "area") if field(item.alert, key)]
-            metadata_label = ttk.Label(header, text=" | ".join(dict.fromkeys(metadata)), wraplength=690)
+            metadata_label = ttk.Label(header, text=text(field(item.alert, "area")), wraplength=690)
             if not self.visual_notification:
                 title.pack(fill="x", pady=(0, 8))
-                metadata_label.pack(fill="x", pady=(0, 8))
+                if field(item.alert, "area"):
+                    metadata_label.pack(fill="x", pady=(0, 8))
             content = ttk.Frame(frame)
             content.pack(fill="both", expand=True)
             # Keep the viewport's allocation stable while asynchronous content
@@ -667,7 +692,9 @@ class _AlertView:
             self.instructions = ScrolledText(content, wrap="word", height=1, width=1,
                                             font=("Segoe UI", 13), takefocus=True)
             self.instructions.grid(row=0, column=0, sticky="nsew")
-            body = text(field(item.alert, "body")) or text(field(item.alert, "description"))
+            body = "\n\n".join(dict.fromkeys(part for part in (
+                text(field(item.alert, "body")), text(field(item.alert, "description")),
+                text(field(item.alert, "instructions"))) if part))
             self.instructions.insert("1.0", body or "No written instructions were supplied with this notification.")
             self.instructions.configure(state="disabled")
             background = text(field(item.alert, "background_color"))
@@ -690,11 +717,12 @@ class _AlertView:
             def resize(event: Any) -> None:
                 if event.widget is self.window:
                     wrap = max(200, event.width - 56)
-                    for label in (title, marker_label, metadata_label, self.status_label):
+                    for label in (title, self.urgency_label, marker_label, metadata_label, self.status_label):
                         label.configure(wraplength=wrap)
             self.window.bind("<Configure>", resize)
             fit_window(self.window, (760, 640), minimum=(420, 320))
-            self.window.attributes("-topmost", item.policy.persistent)
+            # Staying above other apps is independent of expiry/read policy.
+            self.window.attributes("-topmost", True)
             self.window.deiconify()
             self.window.lift()
             self.window.update_idletasks()
@@ -723,8 +751,8 @@ class _AlertView:
             data = self.presenter.image_loader(self.item.alert)
             if not data or len(data) > MAX_IMAGE_BYTES:
                 raise ValueError("Image missing or too large")
-            with Image.open(io.BytesIO(data)) as source:
-                if source.width * source.height > MAX_IMAGE_PIXELS:
+            with Image.open(io.BytesIO(data), formats=NOTIFICATION_IMAGE_FORMATS) as source:
+                if source.width < 1 or source.height < 1 or source.width * source.height > MAX_IMAGE_PIXELS:
                     raise ValueError("Image dimensions exceed the display limit")
                 source.load()
                 resized = ImageOps.exif_transpose(source)
@@ -803,10 +831,11 @@ class _AlertView:
         fit_window(window, (650, 450))
         details = ScrolledText(window, wrap="word", font="TkTextFont")
         details.pack(fill="both", expand=True, padx=12, pady=12)
-        lines = [test_marker(self.item.alert), "", "Acknowledgment is recorded on this device."]
+        lines = [test_marker(self.item.alert), "", "Received by desktop app.",
+                 "Automatic receipt does not confirm human reading or safety."]
         for name in ("title", "event", "severity", "priority", "area", "timestamp", "effective", "expires",
                      "display_timeout_seconds", "display_expires_at", "incident_id", "revision",
-                     "source_endpoint", "body", "description"):
+                     "source_name", "source_endpoint", "message_type", "body", "description", "instructions"):
             value = field(self.item.alert, name)
             if value:
                 lines.extend(("", f"{name.replace('_', ' ').capitalize()}: {value}"))

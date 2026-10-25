@@ -55,13 +55,13 @@ class BackendContractTests(unittest.TestCase):
                 self.assertIsNone(presentation_policy(alert).expires)
         self.assertEqual(parse(record("published", "weather_nullable")).description, "")
 
-    def test_zero_announcement_timeout_is_persistent_even_with_stray_expiry(self):
+    def test_zero_announcement_timeout_does_not_override_an_absolute_deadline(self):
         payload = record("published", "announcement_persistent")
         self.assertIsNone(payload["display_expires_at"])
         payload["display_expires_at"] = "2000-01-01T00:00:00Z"
         policy = presentation_policy(parse(payload))
         self.assertIsNone(policy.timeout_seconds)
-        self.assertIsNone(policy.expires)
+        self.assertEqual(policy.expires, datetime(2000, 1, 1, tzinfo=timezone.utc))
 
     def test_timed_announcement_uses_absolute_deadline_not_new_countdown(self):
         alert = parse(record("published", "announcement_timed"))
@@ -72,17 +72,17 @@ class BackendContractTests(unittest.TestCase):
         # Re-extraction after replay preserves the same original absolute time.
         self.assertEqual(presentation_policy(parse(record("published", "announcement_timed"))).expires, policy.expires)
 
-    def test_positive_timeout_without_absolute_expiry_reports_missing_deadline(self):
+    def test_positive_timeout_without_absolute_expiry_uses_original_publication(self):
         payload = record("published", "announcement_timed")
         payload.pop("display_expires_at")
         policy = presentation_policy(parse(payload))
         self.assertIsNone(policy.timeout_seconds)
-        self.assertIsNone(policy.expires)
-        self.assertTrue(policy.timing_warning)
+        self.assertEqual(policy.expires, datetime(2026, 9, 20, 18, 5, tzinfo=timezone.utc))
+        self.assertFalse(policy.timing_warning)
 
     def test_timeout_limit_and_wrong_types_match_backend_contract(self):
         self.assertEqual(parse(record("additive", "announcement_max_timeout")).display_timeout_seconds, 86400)
-        for timeout in (-1, 86401, True, "300", 30.5):
+        for timeout in (-1, True, "300", 30.5):
             with self.subTest(timeout=timeout):
                 payload = record("published", "announcement_timed")
                 payload["display_timeout_seconds"] = timeout

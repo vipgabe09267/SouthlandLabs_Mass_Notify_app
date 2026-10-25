@@ -76,11 +76,11 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(policy.timeout_seconds, 120)
         self.assertFalse(presentation.presentation_policy(alert(kind="announcement", severity="")).persistent)
 
-    def test_announcement_zero_timeout_has_no_auto_expiry(self):
+    def test_announcement_zero_timeout_does_not_override_absolute_expiry(self):
         policy = presentation.presentation_policy(alert(kind="announcement", severity="notice",
             display_timeout_seconds=0, display_expires_at="2000-01-01T00:00:00Z", expires="2000-01-01T00:00:00Z"))
         self.assertIsNone(policy.timeout_seconds)
-        self.assertIsNone(policy.expires)
+        self.assertEqual(policy.expires, datetime(2000, 1, 1, tzinfo=timezone.utc))
         self.assertFalse(policy.persistent)
 
     def test_positive_announcement_timeout_uses_absolute_deadline_without_reset(self):

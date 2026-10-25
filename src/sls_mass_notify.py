@@ -18,7 +18,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin, urlparse, urlencode, parse_qs
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
@@ -31,7 +31,8 @@ from defusedxml.common import DefusedXmlException
 
 from sls_store import Inbox
 from sls_protocol import (validate_payload, validate_id, profile_namespace, timestamp,
-                          ordered_reconciliation, is_test, LiveSnapshotBaseline)
+                          ordered_reconciliation, is_test, LiveSnapshotBaseline,
+                          notification_expiry, wants_beep)
 from sls_diagnostics import write_log, export_diagnostics
 from sls_presentation import AlertPresenter
 from sls_windowing import fit_window, ScrollableBody, apply_window_icon
@@ -382,6 +383,8 @@ def blank_endpoint(index: int) -> dict:
         "last_fingerprint": "",
         "recent_event_ids": [],
         "live_polling_until": 0,
+        "authenticated_images_enabled": False,
+        "desktop_client_id": "",
     }
 
 
@@ -401,6 +404,8 @@ def normalize_endpoint(value: object, index: int) -> dict:
                 "auth_mode": AUTH_BASIC,
                 "delivery_mode": DELIVERY_LIVE,
                 "reconnect_automatically": bool(value.get("reconnect_automatically", True)),
+                "authenticated_images_enabled": value.get("authenticated_images_enabled") is True,
+                "desktop_client_id": safe_string(value.get("desktop_client_id", "")),
                 "username": safe_string(value.get("username", value.get("user", ""))),
                 "password": value.get("password") if isinstance(value.get("password"), str) else "",
                 "credential_revision": value.get("credential_revision", 0) if type(value.get("credential_revision", 0)) is int else 0,
@@ -523,10 +528,12 @@ def pbx_live_url(endpoint_cfg: dict) -> str:
     return origin + PBX_LIVE_PATH
 
 
-def pbx_recent_url(endpoint_cfg: dict) -> str:
-    """Snapshot endpoint for live polling; the initial retained set is discarded."""
+def pbx_recent_url(endpoint_cfg: dict, last_event_id: str = "", *, limit: int = 100) -> str:
+    """An explicitly empty cursor asks the PBX for a fresh live baseline."""
     origin = normalize_pbx_address(endpoint_cfg.get("endpoint", ""))
-    return origin + PBX_RECENT_PATH + "?limit=100"
+    if type(limit) is not int or not 1 <= limit <= 100:
+        raise ValueError("Desktop polling limit must be between 1 and 100")
+    return origin + PBX_RECENT_PATH + "?" + urlencode({"limit": limit, "last_event_id": validate_id(last_event_id)})
 
 
 def audio_search_dirs() -> list[Path]:
@@ -688,7 +695,7 @@ def load_config() -> dict:
         for profile in loaded["endpoints"]:
             if not isinstance(profile, dict):
                 raise ValueError("Each PBX profile must be an object.")
-            for key in ("enabled", "reconnect_automatically"):
+            for key in ("enabled", "reconnect_automatically", "authenticated_images_enabled"):
                 if key in profile and type(profile[key]) is not bool:
                     raise ValueError(f"Profile {key} must be true or false.")
     days = loaded.get("retention_days", 30)
@@ -920,6 +927,12 @@ class AlertData:
     created_at: str = ""
     delivery_expires_at: str = ""
     response_incident_id: str = ""
+    source_name: str = ""
+    source_namespace: str = ""
+    instructions: str = ""
+    message_type: str = ""
+    beep: bool = True
+    image_authentication: str = ""
 
 
 def safe_hex_color(value: object) -> str:
@@ -1071,6 +1084,10 @@ def extract_alert(data: object, raw_text: str) -> AlertData:
         display_expires_at=safe_string(source.get("display_expires_at", "")) if isinstance(source, dict) else "",
         created_at=safe_string(source.get("created_at", "")) if isinstance(source, dict) else "",
         response_incident_id=response_incident(source),
+        instructions=bounded_text(source.get("instructions", ""), 131072) if isinstance(source, dict) else "",
+        message_type=bounded_text(source.get("message_type", ""), 80) if isinstance(source, dict) else "",
+        beep=wants_beep(source.get("beep", True)) if isinstance(source, dict) else True,
+        image_authentication=safe_string(source.get("image_authentication", "")) if isinstance(source, dict) else "",
     )
 
 
@@ -1089,18 +1106,39 @@ class TlsRequiredError(ApiError):
 class RateLimitedError(ApiError):
     def __init__(self, message: str, retry_after: float = 60):
         super().__init__(message)
-        self.retry_after = min(3600.0, max(1.0, retry_after))
+        self.retry_after = min(86400.0, max(1.0, retry_after))
 
 
 class StreamCapacityError(RateLimitedError):
     """Only the SSE worker pool is full; normal desktop polling is permitted."""
 
 
-class ServiceUnavailableError(ApiError):
+class ServiceUnavailableError(RateLimitedError):
     pass
 
 
+class ReceiptRejectedError(ApiError):
+    """An exact event was rejected permanently; preserve it for review."""
+
+
+def retry_after_seconds(value: object, *, now: float | None = None, default: float = 60) -> float:
+    try:
+        delay = float(value)
+        if not (0 <= delay < float("inf")):
+            raise ValueError("Invalid retry delay")
+    except (ValueError, TypeError):
+        try:
+            delay = parsedate_to_datetime(str(value)).timestamp() - (time.time() if now is None else now)
+        except (ValueError, TypeError, OverflowError):
+            delay = default
+    return min(86400.0, max(1.0, delay))
+
+
 class StreamProtocolError(ApiError):
+    pass
+
+
+class ResponseTooLargeError(ApiError):
     pass
 
 
@@ -1140,6 +1178,10 @@ class SameOriginRedirectHandler(HttpSchemeRedirectHandler):
                 headers,
                 fp,
             )
+        if (req.has_header("Authorization") and urlparse(req.full_url).path == "/api/sipnotify/desktop/media"
+                and newurl != req.full_url):
+            raise urllib.error.HTTPError(req.full_url, code,
+                "Authenticated desktop media redirects are blocked", headers, fp)
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
@@ -1221,8 +1263,16 @@ class SocketDeadline:
 class DeadlineHTTPSConnection(http.client.HTTPSConnection):
     def getresponse(self):
         seconds = self.timeout if isinstance(self.timeout, (float, int)) else SSE_CONNECT_TIMEOUT_SECONDS
-        with SocketDeadline(self.sock, seconds, message="HTTPS response headers exceeded their deadline"):
-            return super().getresponse()
+        response = None
+        try:
+            with SocketDeadline(self.sock, seconds, message="HTTPS response headers exceeded their deadline"):
+                response = super().getresponse()
+            return response
+        except BaseException:
+            if response is not None:
+                response.close()
+            self.close()
+            raise
 
 
 class DeadlineHTTPSHandler(urllib.request.HTTPSHandler):
@@ -1271,15 +1321,13 @@ def raise_http_status(exc: urllib.error.HTTPError, *, stream_request: bool = Fal
     if exc.code == 426:
         raise TlsRequiredError("HTTPS is required by the PBX.") from exc
     if exc.code == 429:
-        try:
-            delay = float(exc.headers.get("Retry-After", "60"))
-        except (ValueError, TypeError):
-            delay = 60
+        delay = retry_after_seconds(exc.headers.get("Retry-After"))
         if stream_capacity:
             raise StreamCapacityError("PBX streaming capacity is full; using live polling.", delay) from exc
         raise RateLimitedError("PBX request limit reached; waiting before retrying.", delay) from exc
     if exc.code == 503:
-        raise ServiceUnavailableError("The PBX desktop notification service is unavailable.") from exc
+        raise ServiceUnavailableError("The PBX desktop notification service is unavailable.",
+                                      retry_after_seconds(exc.headers.get("Retry-After"), default=15)) from exc
     raise ApiError(f"HTTP {exc.code}: {exc.reason}") from exc
 
 
@@ -1297,17 +1345,21 @@ def endpoint_auth_headers(endpoint_cfg: dict) -> dict[str, str]:
 def send_receipt_ack(endpoint_cfg: dict, event_id: str) -> None:
     event_id = validate_id(event_id, optional=False)
     url = normalize_pbx_address(endpoint_cfg.get("endpoint", "")) + PBX_ACK_PATH
-    request = urllib.request.Request(url, data=json.dumps({"event_id": event_id}).encode("utf-8"),
+    request = urllib.request.Request(url, data=json.dumps({"event_id": event_id}, ensure_ascii=False).encode("utf-8"),
         headers={"Content-Type": "application/json", "Accept": "application/json",
                  "User-Agent": f"{APP_SHORT_NAME}/{APP_VERSION}", **endpoint_auth_headers(endpoint_cfg),
                  **desktop_client_headers()}, method="POST")
     try:
         with open_http_request(request, timeout=10, same_origin=True) as response:
             with SocketDeadline(response_socket(response), 10):
-                body = response.read(4097)
+                body = response.read(16 * 1024 + 1)
     except urllib.error.HTTPError as exc:
+        if exc.code in {400, 403, 404, 410, 422}:
+            status = exc.code
+            exc.close()
+            raise ReceiptRejectedError(f"PBX rejected the event receipt (HTTP {status}); administrator review required.") from exc
         raise_http_status(exc)
-    if len(body) > 4096:
+    if len(body) > 16 * 1024:
         raise StreamProtocolError("Receipt response exceeds the size limit")
     data = json.loads(body.decode("utf-8"))
     if not isinstance(data, dict) or data.get("ok") is not True or data.get("event_id") != event_id:
@@ -1324,13 +1376,7 @@ def desktop_client_headers() -> dict[str, str]:
 
 
 def alert_expiry(alert: AlertData) -> float | None:
-    if alert.kind.lower() == "announcement" and alert.display_timeout_seconds is not None:
-        expires = None if alert.display_timeout_seconds == 0 else timestamp(alert.display_expires_at)
-    else:
-        expires = timestamp(alert.display_expires_at or alert.expires)
-    delivery_expires = timestamp(alert.delivery_expires_at)
-    return min(expires, delivery_expires) if expires is not None and delivery_expires is not None else (
-        delivery_expires if delivery_expires is not None else expires)
+    return notification_expiry(asdict(alert))
 
 
 def fetch_endpoint(
@@ -1362,7 +1408,7 @@ def fetch_endpoint(
         raise ApiError("Request timed out") from exc
 
     if len(raw_bytes) > 1024 * 1024:
-        raise ApiError("PBX response exceeded the safety limit")
+        raise ResponseTooLargeError("PBX response exceeded the safety limit")
     raw_text = raw_bytes.decode("utf-8", errors="replace")
     if "json" not in content_type.lower() and not raw_text.lstrip().startswith(("{", "[")):
         raise ApiError("PBX reconciliation response was not JSON")
@@ -1450,8 +1496,11 @@ def iter_sse_events(response, *, on_activity=None, stop_event: threading.Event |
         elif field == "id" and "\x00" not in value:
             event_id = validate_id(value)
             explicit_id = True
-        elif field == "retry" and value.isdigit():
-            retry_ms = min(int(value), 60_000)
+        elif field == "retry" and value.isascii() and value.isdecimal():
+            # SSE permits ASCII decimal digits. Bound conversion before int()
+            # so a legal-sized line cannot exceed Python's integer digit limit.
+            digits = value.lstrip("0") or "0"
+            retry_ms = 60_000 if len(digits) > 5 else min(int(digits), 60_000)
 
 
 def set_stream_read_timeout(response, timeout: int) -> None:
@@ -1466,6 +1515,7 @@ def open_sse_response(
     *,
     timeout: int = SSE_CONNECT_TIMEOUT_SECONDS,
     read_timeout: int = SSE_READ_TIMEOUT_SECONDS,
+    last_event_id: str = "",
 ):
     if not endpoint_has_credentials(endpoint_cfg):
         raise ApiError("Desktop username and password are required.")
@@ -1479,8 +1529,12 @@ def open_sse_response(
         **endpoint_auth_headers(endpoint_cfg),
         **desktop_client_headers(),
     }
-    # No Last-Event-ID: every connection starts at the current journal tail.
-    # Missed broadcasts must never be replayed after startup or reconnect.
+    # Only a planned, healthy stream renewal may continue its current cursor.
+    # Startup, sleep and genuine disconnection always start at the live edge.
+    if last_event_id:
+        # HTTP writes header strings as Latin-1; preserve the server's opaque
+        # UTF-8 identifier bytes instead of rewriting or rejecting Unicode IDs.
+        headers["Last-Event-ID"] = validate_id(last_event_id, optional=False).encode("utf-8").decode("latin-1")
     request = urllib.request.Request(url, headers=headers, method="GET")
     opener = build_http_opener(same_origin=True)
     try:
@@ -1547,6 +1601,9 @@ def fetch_image_bytes(
     image_url: str,
     *,
     source_endpoint: str = "",
+    endpoint_cfg: dict | None = None,
+    event_id: str = "",
+    image_authentication: str = "",
 ) -> bytes:
     parsed = urlparse(image_url)
     if (
@@ -1558,12 +1615,25 @@ def fetch_image_bytes(
         raise ApiError("Alert image URL must be HTTPS without embedded credentials")
     if source_endpoint and request_origin(image_url) != request_origin(source_endpoint):
         raise ApiError("Cross-origin alert media was blocked")
+    headers = {
+        "Accept": "image/png,image/gif,image/*,*/*",
+        "User-Agent": f"{APP_SHORT_NAME}/{APP_VERSION}",
+    }
+    if image_authentication:
+        if (image_authentication != "desktop_basic" or endpoint_cfg is None
+                or endpoint_cfg.get("authenticated_images_enabled") is not True):
+            raise ApiError("Authenticated alert images require the Labs option for this PBX.")
+        if (request_origin(image_url) != request_origin(endpoint_cfg.get("endpoint", ""))
+                or parsed.path != "/api/sipnotify/desktop/media" or parsed.fragment
+                or parse_qs(parsed.query, keep_blank_values=True) != {"event_id": [validate_id(event_id, optional=False)]}):
+            raise ApiError("Authenticated alert image does not match this PBX and exact event.")
+        headers.update(endpoint_auth_headers(endpoint_cfg))
+        if "Authorization" not in headers:
+            raise ApiError("Desktop credentials are unavailable for this image.")
+        headers.update(desktop_client_headers())
     request = urllib.request.Request(
         image_url,
-        headers={
-            "Accept": "image/png,image/gif,image/*,*/*",
-            "User-Agent": f"{APP_SHORT_NAME}/{APP_VERSION}",
-        },
+        headers=headers,
         method="GET",
     )
     with open_http_request(
@@ -1883,7 +1953,7 @@ class SettingsWindow:
             text="Custom WAV files are stored with your app settings.",
             style="Hint.TLabel",
         ).grid(row=5, column=0, columnspan=4, sticky="w", pady=(12, 0))
-        ttk.Checkbutton(audio, text="Read announcements aloud (Piper)", variable=self.tts_var,
+        ttk.Checkbutton(audio, text="Read announcements and alerts aloud (Piper)", variable=self.tts_var,
                         style="Card.TCheckbutton").grid(row=6, column=0, columnspan=4, sticky="w", pady=(14, 6))
         voice_combo = ttk.Combobox(audio, textvariable=self.tts_voice_var, values=list(VOICES.values()),
                                   state="readonly", width=36)
@@ -1985,6 +2055,7 @@ class SettingsWindow:
             "password": StringVar(value=unprotect_secret(safe_string(endpoint.get("password")))),
             "enabled": BooleanVar(value=bool(endpoint.get("enabled", index == 0))),
             "reconnect_automatically": BooleanVar(value=bool(endpoint.get("reconnect_automatically", True))),
+            "authenticated_images_enabled": BooleanVar(value=endpoint.get("authenticated_images_enabled") is True),
             "show_password": BooleanVar(value=False),
             "password_entry": None,
             "warning_label": None,
@@ -2040,6 +2111,9 @@ class SettingsWindow:
 
         warning_label = ttk.Label(parent, text="", style="InsetHint.TLabel", wraplength=820)
         warning_label.grid(row=6, column=0, columnspan=4, sticky="w", pady=(10, 0))
+        ttk.Checkbutton(parent, text="\U0001f9ea Labs: authenticated images (requires compatible PBX)",
+                        variable=form["authenticated_images_enabled"], style="Inset.TCheckbutton").grid(
+                            row=7, column=0, columnspan=4, sticky="w", pady=(10, 0))
         form["warning_label"] = warning_label
         parent.columnconfigure(0, weight=1)
         parent.columnconfigure(1, weight=1)
@@ -2203,6 +2277,8 @@ class SettingsWindow:
                     "auth_mode": AUTH_BASIC,
                     "delivery_mode": DELIVERY_LIVE,
                     "reconnect_automatically": bool(form["reconnect_automatically"].get()),
+                    "authenticated_images_enabled": (bool(form["authenticated_images_enabled"].get())
+                                                       if "authenticated_images_enabled" in form else False),
                     "username": username,
                     "password": password,
                     "credential_revision": int(self.app.get_endpoint_state(index, "credential_revision") or 0),
@@ -2284,6 +2360,7 @@ def endpoint_worker_signature(endpoint_cfg: dict) -> str:
         "password",
         "credential_revision",
         "reconnect_automatically",
+        "authenticated_images_enabled",
     )
     selected = {key: endpoint_cfg.get(key) for key in keys}
     return json.dumps(selected, sort_keys=True, separators=(",", ":"))
@@ -2307,6 +2384,21 @@ def reconciliation_records(data: object, last_event_id: str) -> list[dict]:
     return ordered_reconciliation(data, last_event_id)
 
 
+def desktop_transport_preference(data: dict) -> str | None:
+    """Only the documented capability object chooses a future transport."""
+    capabilities = data.get("transport_capabilities")
+    if capabilities is None:
+        return None
+    if not isinstance(capabilities, dict):
+        raise StreamProtocolError("Invalid desktop transport capabilities")
+    # Unknown additive capabilities remain harmless to schema-1 JSON polling.
+    if (capabilities.get("preferred") == "sse" and capabilities.get("sse_available") is True
+            and type(capabilities.get("sse_protocol", 2)) is int and capabilities.get("sse_protocol", 2) == 2
+            and type(capabilities.get("payload_schema", 1)) is int and capabilities.get("payload_schema", 1) == 1):
+        return "sse"
+    return "json_poll"
+
+
 class EndpointTransportWorker:
     def __init__(self, app: "MassNotifyApp", index: int, endpoint_cfg: dict) -> None:
         self.app = app
@@ -2321,6 +2413,7 @@ class EndpointTransportWorker:
         self.stream_ready = threading.Event()
         self.session_id = ""
         self.client_id = ""
+        self.preferred_transport = None
         self.server_retry_seconds = 1.0
         self.authenticated_event = threading.Event()
         self.auth_lock = threading.RLock()
@@ -2400,6 +2493,13 @@ class EndpointTransportWorker:
         signals = getattr(self.app, "system_signals", None)
         if signals is not None and signals.blocked:
             return False
+        if hasattr(self.app, "config"):
+            with self.app.config_lock:
+                profiles = self.app.config["endpoints"]
+                if (not self.app.config.get("enabled", True) or not 0 <= self.index < len(profiles)
+                        or not profiles[self.index].get("enabled", True)
+                        or endpoint_worker_signature(profiles[self.index]) != self.signature):
+                    return False
         if hasattr(self.app, "workers"):
             with self.app.worker_lock:
                 return self.app.workers.get(self.index) is self
@@ -2412,16 +2512,32 @@ class EndpointTransportWorker:
         if self.app.record_fault(key, message, recoverable=recoverable):
             log(message)
 
-    def run(self) -> None:
-        if 0 < self.endpoint_cfg.get("live_polling_until", 0) - time.time() <= 86400:
-            self._run_live_polling()
-            return
-        self._run_live()
+    def _bind_desktop_identity(self, identifier: object) -> bool:
+        """A replaced PBX enrollment must not inherit another client's receipts."""
+        identifier = validate_id(identifier)
+        if not identifier or identifier == self.endpoint_cfg.get("desktop_client_id", ""):
+            return False
+        with self.auth_lock, getattr(self.app, "config_lock", nullcontext()):
+            if not self._is_current():
+                return False
+            if hasattr(self.app, "bind_desktop_identity"):
+                self.app.bind_desktop_identity(self.index, self.signature, identifier)
+            self._invalidate_auth()
+            self.endpoint_cfg["desktop_client_id"] = identifier
+            self.preferred_transport = None
+            self.endpoint_cfg["last_stream_id"] = ""
+            self.endpoint_cfg["last_event_id"] = ""
+            self.endpoint_cfg["live_polling_until"] = 0
+            return True
 
-    def _run_live(self) -> None:
+    def run(self) -> None:
+        self._run_live_polling(negotiate_transport=True)
+
+    def _run_live(self, *, initial_cursor: str = "") -> None:
         name = endpoint_display_name(self.index, self.endpoint_cfg)
         backoff_index = 0
-        while not self.stop_event.is_set():
+        continuation_cursor = initial_cursor
+        while self._is_current():
             if self.revoked_event.is_set():
                 self._status("AUTH_FAILED", f"{name}: credentials require review before reconnecting")
                 self.stop_event.wait()
@@ -2431,8 +2547,11 @@ class EndpointTransportWorker:
             self.authenticated_this_attempt = False
             self._status("CONNECTING", f"{name}: opening authenticated live stream")
             try:
-                self.app.inbox.expire_active(profile_namespace(self.endpoint_cfg), include_displayed=False)
-                response = open_sse_response(self.endpoint_cfg)
+                attempt_cursor, continuation_cursor = continuation_cursor, ""
+                if not attempt_cursor:
+                    self.app.inbox.expire_active(profile_namespace(self.endpoint_cfg), include_displayed=False)
+                response = (open_sse_response(self.endpoint_cfg, last_event_id=attempt_cursor)
+                            if attempt_cursor else open_sse_response(self.endpoint_cfg))
                 self._track_response(response)
                 try:
                     authenticated_this_attempt, reconnect_requested = self._consume_stream(response)
@@ -2444,6 +2563,9 @@ class EndpointTransportWorker:
                 if not authenticated_this_attempt:
                     raise StreamProtocolError("The stream ended before the authenticated handshake.")
                 backoff_index = 0
+                # A cursor reset is a fresh baseline, never a continuation.
+                if reconnect_requested and not getattr(self, "cursor_reset_requested", False):
+                    continuation_cursor = self.endpoint_cfg.get("last_stream_id", "")
                 if not bool(self.endpoint_cfg.get("reconnect_automatically", True)):
                     self._status("DISCONNECTED", f"{name}: live stream closed; automatic reconnect is off")
                     self.stop_event.wait()
@@ -2471,13 +2593,14 @@ class EndpointTransportWorker:
                 self._fault(message)
                 self.stop_event.wait()
                 return
-            except StreamCapacityError:
+            except StreamCapacityError as exc:
                 if not self._is_current():
                     return
                 # Retry-After applies to opening another SSE stream, not to
                 # the separate authenticated polling endpoint. This worker
                 # stays in polling and discards its initial retained snapshot.
                 log(f"{name}: PBX streaming capacity is full; switching immediately to live polling.")
+                self.sse_retry_after = exc.retry_after
                 self._run_live_polling()
                 return
             except RateLimitedError as exc:
@@ -2515,28 +2638,85 @@ class EndpointTransportWorker:
                 if self.stop_event.wait(delay):
                     return
 
-    def _run_live_polling(self) -> None:
-        """Fallback for blocked/buffered SSE; never replay an initial snapshot."""
+    def _run_live_polling(self, *, negotiate_transport: bool = False) -> None:
+        """Drain cursor pages while connected; discard every fresh baseline."""
         baseline = LiveSnapshotBaseline()
+        cursor = ""
+        seen_cursors = set()
+        last_poll = None
+        poll_interval = 5.0
+        page_limit = 100
         name = endpoint_display_name(self.index, self.endpoint_cfg)
-        if hasattr(self.app, "remember_polling_fallback"):
-            self.app.remember_polling_fallback(self.index, self.signature)
+        if not negotiate_transport and hasattr(self.app, "remember_polling_fallback"):
+            self.app.remember_polling_fallback(self.index, self.signature,
+                retry_after=getattr(self, "sse_retry_after", 86400))
         self._invalidate_auth()
         self.app.inbox.expire_active(profile_namespace(self.endpoint_cfg), include_displayed=False)
-        self._status("CONNECTING", f"{name}: establishing live polling after a stream failure")
+        self._status("CONNECTING", f"{name}: establishing live polling")
         while self._is_current():
-            delay = 5.0
+            delay = poll_interval
+            generation = self.auth_generation
             try:
                 if self.revoked_event.is_set():
                     raise UnauthorizedError("Desktop credentials require review before reconnecting.")
-                data, _raw, server_time = fetch_endpoint(pbx_recent_url(self.endpoint_cfg),
-                    endpoint_auth_headers(self.endpoint_cfg), include_server_time=True)
+                if last_poll is not None and time.monotonic() - last_poll > max(15, 3 * poll_interval):
+                    cursor = ""
+                    baseline.reset()
+                    seen_cursors.clear()
+                try:
+                    data, _raw, server_time = fetch_endpoint(pbx_recent_url(self.endpoint_cfg, cursor, limit=page_limit),
+                        endpoint_auth_headers(self.endpoint_cfg), include_server_time=True)
+                except ResponseTooLargeError:
+                    if page_limit == 1:
+                        raise
+                    page_limit = max(1, page_limit // 4)
+                    # A bounded authenticated HTTP 200 is connection activity.
+                    # Retry this opaque cursor without turning it into a baseline.
+                    if generation == self.auth_generation:
+                        last_poll = time.monotonic()
+                    continue
                 ensure_api_ok(data)
                 records = ordered_reconciliation(data)
-                if not self._is_current():
-                    return
-                fresh = baseline.observe(records, server_time, time.time())
-                with self.auth_lock:
+                with self.auth_lock, getattr(self.app, "config_lock", nullcontext()):
+                    if not self._is_current():
+                        return
+                    if generation != self.auth_generation:
+                        continue
+                    client_identity = data.get("client", {})
+                    if isinstance(client_identity, dict):
+                        # First-time binding also establishes a fresh baseline.
+                        if self._bind_desktop_identity(client_identity.get("client_id")):
+                            cursor = ""
+                            baseline.reset()
+                            generation = self.auth_generation
+                    preference = desktop_transport_preference(data)
+                    if preference is not None:
+                        self.preferred_transport = preference
+                    interval = data.get("poll_interval_seconds", poll_interval)
+                    if type(interval) not in (int, float) or not 1 <= interval <= 300:
+                        raise StreamProtocolError("Invalid desktop polling interval")
+                    poll_interval = delay = float(interval)
+                next_cursor = None
+                has_more = False
+                if "last_event_id" in data:
+                    next_cursor = validate_id(data["last_event_id"], optional=False)
+                    for flag in ("has_more", "cursor_gap", "cursor_reset", "unchanged"):
+                        if flag in data and type(data[flag]) is not bool:
+                            raise StreamProtocolError("Invalid polling cursor metadata")
+                    has_more = data.get("has_more", False)
+                    reset = data.get("cursor_gap", False) or data.get("cursor_reset", False)
+                    fresh = records if cursor and not reset else []
+                    if has_more and (not cursor or reset or next_cursor == cursor or next_cursor in seen_cursors):
+                        raise StreamProtocolError("PBX polling pagination did not advance")
+                    if data.get("unchanged") is True and (records or has_more or next_cursor != cursor):
+                        raise StreamProtocolError("PBX unchanged response contains conflicting cursor metadata")
+                else:
+                    if data.get("has_more"):
+                        raise StreamProtocolError("PBX pagination omitted its cursor")
+                    fresh = baseline.observe(records, server_time, time.time())
+                with self.auth_lock, getattr(self.app, "config_lock", nullcontext()):
+                    if generation != self.auth_generation:
+                        continue
                     if self.revoked_event.is_set():
                         raise UnauthorizedError("Desktop credentials were revoked or changed.")
                     if not self._is_current():
@@ -2546,19 +2726,48 @@ class EndpointTransportWorker:
                     self.stream_ready.set()
                     generation = self.auth_generation
                 self.app.clear_fault(f"endpoint-{self.index}")
-                self._status("POLLING", f"{name}: receiving new announcements through live polling (5 seconds)")
+                self.server_clock_skew = server_time - time.time()
+                self._status("POLLING", f"{name}: Connected (polling; {poll_interval:g} seconds)")
                 for payload in fresh:
                     self._accept_payload(payload, json.dumps(payload), delivery_source="live polling",
                                          auth_generation=generation)
+                with self.auth_lock, getattr(self.app, "config_lock", nullcontext()):
+                    if not self._generation_is_current(generation):
+                        continue
+                    if next_cursor is not None:
+                        cursor = next_cursor
+                    last_poll = time.monotonic()
+                if has_more:
+                    seen_cursors.add(cursor)
+                    if len(seen_cursors) > 1000:
+                        raise StreamProtocolError("PBX polling exceeded the pagination safety limit")
+                    continue  # Drain this burst before the next five-second wait.
+                seen_cursors.clear()
+                sse_cooldown = 0 < self.endpoint_cfg.get("live_polling_until", 0) - time.time() <= 86400
+                if negotiate_transport and self.preferred_transport != "json_poll" and not sse_cooldown:
+                    if not self._is_current():
+                        return
+                    if cursor:
+                        self._run_live(initial_cursor=cursor)
+                    else:
+                        self._run_live()  # Compatibility with an older latest-only PBX.
+                    return
             except (UnauthorizedError, TlsRequiredError) as exc:
-                self._invalidate_auth(revoked=True)
+                if not self._is_current() or generation != self.auth_generation:
+                    return
+                self._invalidate_auth(revoked=True, generation=generation)
                 self._fault(str(exc))
                 self._status("AUTH_FAILED" if isinstance(exc, UnauthorizedError) else "TLS_REQUIRED", f"{name}: {exc}")
                 self.stop_event.wait()
                 return
             except Exception as exc:
                 baseline.reset()
-                self._invalidate_auth()
+                cursor = ""
+                last_poll = None
+                seen_cursors.clear()
+                if generation != self.auth_generation:
+                    continue
+                self._invalidate_auth(generation=generation)
                 if not self._is_current():
                     return
                 self.app.inbox.expire_active(profile_namespace(self.endpoint_cfg), include_displayed=False)
@@ -2577,27 +2786,41 @@ class EndpointTransportWorker:
                 return
             generation = self._authenticated_generation()
             if generation is None:
+                if not self._is_current():
+                    return
+                self.stop_event.wait(1)
                 continue
             delay = 2.0
             try:
                 if not self._generation_is_current(generation):
                     continue
                 namespace = profile_namespace(self.endpoint_cfg)
-                for receipt in self.app.inbox.pending_receipts(namespace, limit=1):
+                for receipt in self.app.inbox.pending_receipts(namespace, limit=16):
                     try:
                         if not self._generation_is_current(generation):
                             break
                         send_receipt_ack(self.endpoint_cfg, receipt["event_id"])
-                        if not self._generation_is_current(generation):
-                            break
-                        self.app.inbox.receipt_sent(receipt["receipt_id"])
-                        self.app.clear_fault(f"receipt-{self.index}")
+                        with self.auth_lock, getattr(self.app, "config_lock", nullcontext()):
+                            if not self._generation_is_current(generation):
+                                break
+                            self.app.inbox.receipt_sent(receipt["receipt_id"])
+                            self.app.clear_fault(f"receipt-{self.index}")
                     except Exception as exc:
-                        self.app.inbox.receipt_failed(receipt["receipt_id"], str(exc))
-                        self.app.record_fault(f"receipt-{self.index}", "PBX receipt synchronization failed; saved receipts will retry.", recoverable=not isinstance(exc, UnauthorizedError))
+                        with self.auth_lock, getattr(self.app, "config_lock", nullcontext()):
+                            if not self._generation_is_current(generation):
+                                break
+                            if isinstance(exc, ReceiptRejectedError):
+                                self.app.inbox.receipt_rejected(receipt["receipt_id"], str(exc))
+                                self.app.record_fault(f"receipt-rejected-{self.index}",
+                                    "The PBX rejected a saved event receipt. Administrator review is required.")
+                                continue
+                            self.app.inbox.receipt_failed(receipt["receipt_id"], str(exc),
+                                retry_after=exc.retry_after if isinstance(exc, RateLimitedError) else 0)
                         raise
             except UnauthorizedError as exc:
-                self._invalidate_auth(revoked=True)
+                if not self._generation_is_current(generation):
+                    continue
+                self._invalidate_auth(revoked=True, generation=generation)
                 self._fault(str(exc))
                 self._status("AUTH_FAILED", str(exc))
                 self.stop_event.wait()
@@ -2622,7 +2845,7 @@ class EndpointTransportWorker:
         try:
             return self._consume_authenticated_stream(response, generation)
         finally:
-            self._invalidate_auth(generation=generation)
+            self._invalidate_auth()
 
     def _consume_authenticated_stream(self, response, generation: int) -> tuple[bool, bool]:
         deadline = time.monotonic() + SSE_TEST_TIMEOUT_SECONDS
@@ -2643,6 +2866,7 @@ class EndpointTransportWorker:
     def _read_authenticated_stream(self, response, generation: int, activity, watchdog) -> tuple[bool, bool]:
         authenticated = False
         reconnect_requested = False
+        self.cursor_reset_requested = False
         last_wall_activity = time.time()
 
         def complete_activity() -> None:
@@ -2651,11 +2875,10 @@ class EndpointTransportWorker:
             if authenticated and now - last_wall_activity >= SSE_READ_TIMEOUT_SECONDS:
                 raise StreamProtocolError("Live stream was interrupted; buffered notifications discarded")
             last_wall_activity = now
-            # Before authentication the fixed deadline cannot be renewed. After
-            # authentication, only a complete SSE line counts as stream activity.
+            # Track complete lines for sleep detection. Only dispatched heartbeat
+            # or notification events renew the authenticated stream deadline.
             if authenticated:
                 self.last_activity = time.monotonic()
-                watchdog.renew(self.last_activity + SSE_READ_TIMEOUT_SECONDS)
             else:
                 activity()
 
@@ -2685,6 +2908,8 @@ class EndpointTransportWorker:
                     if (self.revoked_event.is_set() or generation != self.auth_generation
                             or not self._is_current()):
                         raise UnauthorizedError("Desktop authentication is no longer active.")
+                    self._bind_desktop_identity(payload.get("client_id"))
+                    generation = self.auth_generation
                     if event.explicit_id and event.event_id and hasattr(self.app, "inbox"):
                         self.app.inbox.advance_cursor(profile_namespace(self.endpoint_cfg), event.event_id, force=True)
                         self.endpoint_cfg["last_stream_id"] = self.app.inbox.cursor(profile_namespace(self.endpoint_cfg))
@@ -2706,13 +2931,14 @@ class EndpointTransportWorker:
             if event.name in {"_heartbeat", "notification"}:
                 first_signal = not self.stream_ready.is_set()
                 self.last_stream_signal = time.monotonic()
+                watchdog.renew(self.last_stream_signal + SSE_READ_TIMEOUT_SECONDS)
                 self.stream_ready.set()
                 if first_signal:
                     self._status("AUTHENTICATED", f"{endpoint_display_name(self.index, self.endpoint_cfg)}: connected with live stream activity")
             if event.name == "notification":
                 try:
                     payload = json.loads(event.data)
-                except json.JSONDecodeError:
+                except (ValueError, RecursionError):
                     self._quarantine_payload(event.data, event.event_id if event.explicit_id else "", "PBX sent invalid notification JSON.", auth_generation=generation)
                     continue
                 self._accept_payload(payload, event.data, event.event_id if event.explicit_id else "", delivery_source="live stream", auth_generation=generation)
@@ -2723,6 +2949,7 @@ class EndpointTransportWorker:
                 # A live-only connection never asks for replay. Do not consume
                 # retained events if a server unexpectedly enters recovery mode.
                 reconnect_requested = True
+                self.cursor_reset_requested = True
                 break
             elif event.name == "revoked":
                 self._invalidate_auth(revoked=True)
@@ -2763,8 +2990,11 @@ class EndpointTransportWorker:
             )
             return False
         alert = extract_alert(payload, raw_text)
-        if not alert.event_id:
-            alert.event_id = stream_event_id or alert.fingerprint
+        try:
+            alert.event_id = validate_id(payload.get("id") or payload.get("event_id") or stream_event_id, optional=False)
+        except ValueError:
+            self._quarantine_payload(payload, stream_event_id, "Notification omitted its published event ID.")
+            return False
         if stream_event_id and stream_event_id != alert.event_id:
             self._quarantine_payload(payload, stream_event_id, "SSE ID does not match its notification ID.")
             return False
@@ -2862,7 +3092,7 @@ class MassNotifyApp:
             on_failed=self.alert_failed,
             audio_handler=self.notification_audio.submit,
             cancel_audio=self.notification_audio.cancel,
-            image_loader=lambda alert: fetch_image_bytes(alert.image_url, source_endpoint=alert.source_endpoint),
+            image_loader=self.load_alert_image,
             on_incident_response=self.show_incident_response,
             can_display=self.can_display_record,
             on_discarded=self._scheduled_records.discard)
@@ -2901,7 +3131,22 @@ class MassNotifyApp:
                     and (record["expires"] is None or record["expires"] > time.time())
                     and record["namespace"] in {profile_namespace(p) for _, p in active_endpoints(cfg)})
 
+    def load_alert_image(self, alert: AlertData) -> bytes:
+        # Never select credentials by hostname: two accounts may share an origin.
+        profile = None
+        if alert.image_authentication:
+            with self.config_lock:
+                profiles = [p for _, p in active_endpoints(self.config)
+                            if alert.source_namespace and profile_namespace(p) == alert.source_namespace]
+                if not self.config.get("enabled", True) or len(profiles) != 1:
+                    raise ApiError("The alert's desktop profile is no longer active.")
+                profile = dict(profiles[0])
+        return fetch_image_bytes(alert.image_url, source_endpoint=alert.source_endpoint,
+            endpoint_cfg=profile, event_id=alert.event_id, image_authentication=alert.image_authentication)
+
     def play_notification_sound(self, _alert) -> float:
+        if not wants_beep(getattr(_alert, "beep", True)):
+            return 0.0
         try:
             duration = play_alert_sound(self.get_config().get("audio_sound", DEFAULT_AUDIO_NAME))
             self.clear_fault("audio")
@@ -2912,7 +3157,7 @@ class MassNotifyApp:
             return 0.0
 
     def speech_activity(self, stage: str, voice: str, elapsed: float) -> None:
-        log(f"Announcement audio {stage}; voice={voice}; elapsed={elapsed:.2f}s")
+        log(f"Notification audio {stage}; voice={voice}; elapsed={elapsed:.2f}s")
         self.ui_queue.put(("speech_status", stage))
 
     def alert_displayed(self, record_id: str) -> None:
@@ -3059,7 +3304,9 @@ class MassNotifyApp:
         def current_profile():
             current = self.get_config()
             if (self.stop_event.is_set() or not current.get("enabled", True)
-                    or not any(endpoint_worker_signature(item) == signature for _, item in active_endpoints(current))):
+                    or not any(endpoint_worker_signature(item) == signature
+                               and profile_namespace(item) == record["namespace"]
+                               for _, item in active_endpoints(current))):
                 raise UnauthorizedError("The PBX profile changed. Close this response window and reopen it.")
             signals = getattr(self, "system_signals", None)
             if signals is not None and signals.blocked:
@@ -3090,6 +3337,11 @@ class MassNotifyApp:
     def show_health(self) -> None:
         with self.worker_lock:
             lines = [f"PBX {index + 1}: {state}\n{detail}" for index, (state, detail) in self.transport_statuses.items()]
+            for index, worker in self.workers.items():
+                skew = getattr(worker, "server_clock_skew", None)
+                if skew is not None:
+                    lines.append(f"PBX {index + 1}: server HTTP Date differs from this computer by {skew:+.0f} seconds."
+                                 + (" Check both clocks; absolute expiry can be affected." if abs(skew) >= 120 else ""))
         with self.faults_lock:
             lines.extend(str(fault["message"]) for fault in self.faults.values())
         lines.append("Inbox: " + json.dumps(self.inbox.statistics()))
@@ -3181,7 +3433,13 @@ class MassNotifyApp:
                         old_secret = old.get("password", "")
                         if old_secret.startswith("cred:"):
                             retired_targets.append(old_secret[5:])
-                    if profile_namespace(old) != profile_namespace(candidate):
+                    # The Settings form edits an account, not the server-issued
+                    # enrollment binding. Retain that binding for an unchanged
+                    # origin/username even when the form does not carry it.
+                    if (profile_namespace(dict(old, desktop_client_id=""))
+                            != profile_namespace(dict(candidate, desktop_client_id=""))):
+                        candidate["desktop_client_id"] = ""
+                        candidate["live_polling_until"] = 0
                         for key in ("last_event_id", "last_stream_id", "last_fingerprint"):
                             candidate[key] = ""
                         candidate["recent_event_ids"] = []
@@ -3189,6 +3447,7 @@ class MassNotifyApp:
                         # Preserve state accepted while Settings was open.
                         for key in ("last_event_id", "last_stream_id", "last_fingerprint", "recent_event_ids", "live_polling_until"):
                             candidate[key] = old.get(key, [] if key == "recent_event_ids" else "")
+                        candidate["desktop_client_id"] = old.get("desktop_client_id", "")
                 updated = normalize_config(dict(self.config, endpoints=new_profiles, enabled=bool(enabled),
                     startup_enabled=bool(startup_enabled), auto_update_enabled=bool(auto_update_enabled),
                     audio_sound=safe_audio_name(audio_sound or DEFAULT_AUDIO_NAME),
@@ -3289,13 +3548,15 @@ class MassNotifyApp:
             if worker_signature and endpoint_worker_signature(endpoint) != worker_signature:
                 return False
             namespace = profile_namespace(endpoint)
+            alert.source_name = safe_string(endpoint.get("name")) or f"PBX {index + 1}"
+            alert.source_namespace = namespace
             event_id = validate_id(alert.event_id or alert.fingerprint, optional=False)
             if alert.kind.lower() == "announcement":
-                published = timestamp(alert.created_at)
-                # Missing/future sender times cannot extend the local queue.
-                start = min(published, now) if published is not None else now
+                # Freeze the earliest original deadline at first receipt. Legacy
+                # messages without publication time use this receipt only once.
+                deadline = notification_expiry(asdict(alert), received_at=now)
                 alert.delivery_expires_at = datetime.fromtimestamp(
-                    start + ANNOUNCEMENT_MAX_AGE_SECONDS, timezone.utc).isoformat()
+                    deadline, timezone.utc).isoformat()
             expires = alert_expiry(alert)
             effective = timestamp(alert.effective)
             state = "expired" if expires is not None and (expires <= now or (
@@ -3331,13 +3592,24 @@ class MassNotifyApp:
             self.inbox.quarantine(profile_namespace(endpoint), event_id, payload, error, stream_id=stream_id)
         self.record_fault(f"protocol-{index}", "A PBX notification could not be interpreted. It was retained for review; open Health for details.")
 
-    def remember_polling_fallback(self, index: int, signature: str) -> None:
+    def bind_desktop_identity(self, index: int, signature: str, identifier: str) -> None:
+        with self.config_lock:
+            profile = self.config["endpoints"][index]
+            if endpoint_worker_signature(profile) != signature:
+                raise StreamProtocolError("The desktop profile changed during authentication.")
+            staged = normalize_config(self.config)
+            staged["endpoints"][index].update(desktop_client_id=identifier, last_stream_id="", last_event_id="", live_polling_until=0)
+            save_config(staged)
+            self.inbox.expire_active(profile_namespace(profile), include_displayed=False)
+            self.config = staged
+
+    def remember_polling_fallback(self, index: int, signature: str, *, retry_after: float = 86400) -> None:
         with self.config_lock:
             endpoint = self.config["endpoints"][index]
             if endpoint_worker_signature(endpoint) != signature:
                 return
             staged = normalize_config(self.config)
-            staged["endpoints"][index]["live_polling_until"] = time.time() + 86400
+            staged["endpoints"][index]["live_polling_until"] = time.time() + min(86400, max(1, retry_after))
             try:
                 save_config(staged)
             except OSError as exc:
@@ -3435,6 +3707,17 @@ class MassNotifyApp:
             self.config = staged
 
     def process_ui_queue(self) -> None:
+        try:
+            self._process_ui_queue()
+            self.clear_fault("ui-dispatch")
+        except Exception as exc:
+            self.record_fault("ui-dispatch", "The notification display needs attention; retrying automatically.")
+            log(f"UI dispatch recovered from error: {type(exc).__name__}")
+        finally:
+            if not self.stop_event.is_set():
+                self.root.after(100, self.process_ui_queue)
+
+    def _process_ui_queue(self) -> None:
         self.check_delivery_resume()
         toast = getattr(self, "fault_toast", None)
         if toast is not None:
@@ -3498,7 +3781,6 @@ class MassNotifyApp:
                 log(f"UI dispatch failed: {exc}")
         if not self.stop_event.is_set():
             self.pump_inbox()
-            self.root.after(100, self.process_ui_queue)
 
     def present_alert(self, alert: AlertData) -> None:
         # Compatibility for explicit previews only. Network delivery uses pump_inbox.
@@ -3561,11 +3843,24 @@ class MassNotifyApp:
                                 successes += 1
                                 continue
                             raise StreamProtocolError("The monitor has no recent heartbeat or notification. Check Health and the PBX streaming/proxy configuration.")
-                        response = open_sse_response(
-                            endpoint_cfg,
-                            timeout=SSE_TEST_TIMEOUT_SECONDS,
-                            read_timeout=SSE_TEST_TIMEOUT_SECONDS,
-                        )
+                        data, _raw, _server_time = fetch_endpoint(pbx_recent_url(endpoint_cfg, limit=1),
+                            endpoint_auth_headers(endpoint_cfg), include_server_time=True)
+                        ensure_api_ok(data)
+                        ordered_reconciliation(data)
+                        if desktop_transport_preference(data) == "json_poll":
+                            successes += 1
+                            continue
+                        try:
+                            response = open_sse_response(
+                                endpoint_cfg,
+                                timeout=SSE_TEST_TIMEOUT_SECONDS,
+                                read_timeout=SSE_TEST_TIMEOUT_SECONDS,
+                            )
+                        except StreamCapacityError:
+                            # Older PBXs may omit negotiation capabilities but
+                            # explicitly permit the authenticated polling fallback.
+                            successes += 1
+                            continue
                         set_stream_read_timeout(response, 25)
                         watchdog = SocketDeadline(response_socket(response), 25)
                         try:
@@ -3663,6 +3958,13 @@ class MassNotifyApp:
 
 
 def main() -> None:
+    if len(sys.argv) == 4 and sys.argv[1] == "--speech-worker":
+        from sls_speech_worker import run_worker
+        try:
+            run_worker(Path(sys.argv[2]), int(sys.argv[3]))
+        except Exception:
+            raise SystemExit(1) from None
+        return
     if len(sys.argv) == 3 and sys.argv[1] == "--check-announcement-audio":
         from sls_speech_probe import check
         try:
