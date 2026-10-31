@@ -16,7 +16,7 @@ from PyInstaller.archive.readers import CArchiveReader
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
-from sls_version import VERSION
+from sll_version import VERSION
 from build_setup_bootstrap import source_digest
 
 
@@ -76,36 +76,44 @@ def verify(directory, main):
         path = directory / item["path"]
         if path.stat().st_size != item["size"] or digest(path) != item["sha256"]:
             raise SystemExit(f"Artifact inventory mismatch: {path}")
-    executable = directory / ("SLS_Mass_Notify.exe" if main == "sls_mass_notify" else "SLS_Mass_Notify_Installer.exe")
+    executable = directory / ("SLL_Mass_Notify.exe" if main == "sll_mass_notify" else "SLL_Mass_Notify_Installer.exe")
     with pefile.PE(str(executable)) as image:
         if image.FILE_HEADER.Machine != 0x8664:
             raise SystemExit(f"Unexpected executable architecture: {executable}")
         versions = []
+        branding = []
         for section in getattr(image, "FileInfo", []):
             for item in section:
                 for strings in getattr(item, "StringTable", []):
                     versions.append(strings.entries.get(b"FileVersion", b"").decode("utf-8"))
+                    branding.append(strings.entries)
         if VERSION not in versions:
             raise SystemExit(f"Executable version resource does not match {VERSION}: {executable}")
+        expected_brand = {b"CompanyName": b"Southland Labs",
+                          b"ProductName": b"Southland Labs Mass Notify",
+                          b"OriginalFilename": executable.name.encode("utf-8")}
+        if not branding or any(any(table.get(key) != value for key, value in expected_brand.items())
+                               for table in branding):
+            raise SystemExit(f"Executable branding does not match Southland Labs: {executable}")
     archive = CArchiveReader(str(executable))
     source = compile((ROOT / "src" / f"{main}.py").read_bytes(), str(ROOT / "src" / f"{main}.py"), "exec", optimize=0)
     if not code_equal(marshal.loads(archive.extract(main)), source):
         raise SystemExit(f"Packaged entry point differs from source: {main}")
     modules = archive.open_embedded_archive("PYZ.pyz")
     for name in modules.toc:
-        if name.startswith("sls_") and (ROOT / "src" / f"{name}.py").exists():
+        if name.startswith("sll_") and (ROOT / "src" / f"{name}.py").exists():
             source = compile((ROOT / "src" / f"{name}.py").read_bytes(), str(ROOT / "src" / f"{name}.py"), "exec", optimize=0)
             if not code_equal(modules.extract(name), source):
                 raise SystemExit(f"Packaged module differs from current source: {name}")
-    verify_runtime_binaries(directory, include_sqlite=main == "sls_mass_notify")
+    verify_runtime_binaries(directory, include_sqlite=main == "sll_mass_notify")
     return executable
 
 
 def main():
     distribution = ROOT / "dist"
     expected_executables = {
-        "SLS_Mass_Notify/SLS_Mass_Notify.exe",
-        "SLS_Mass_Notify_Installer.exe",
+        "SLL_Mass_Notify/SLL_Mass_Notify.exe",
+        "SLL_Mass_Notify_Installer.exe",
     }
     actual_executables = {path.relative_to(distribution).as_posix()
                           for path in distribution.rglob("*")
@@ -114,36 +122,39 @@ def main():
         raise SystemExit("Unexpected or missing EXEs in dist; rebuild with -Clean. "
                          f"Extra: {sorted(actual_executables - expected_executables)}; "
                          f"missing: {sorted(expected_executables - actual_executables)}")
-    application = verify(ROOT / "dist" / "SLS_Mass_Notify", "sls_mass_notify")
+    application = verify(ROOT / "dist" / "SLL_Mass_Notify", "sll_mass_notify")
     voice_dir = application.parent / "_internal" / "tts"
     if {path.name for path in voice_dir.glob("*.onnx")} != {"en_US-lessac-low.onnx"}:
         raise SystemExit("Only Lessac low may be bundled; other voices must be optional downloads")
-    from sls_voices import read_catalog
+    from sll_voices import read_catalog
     read_catalog(voice_dir / "voices.json")
     from check_speech_runtime import check as check_speech
     check_speech(application)
     from check_optional_voice_runtime import check as check_optional_voice
     check_optional_voice(application)
-    with tempfile.TemporaryDirectory(prefix="sls-audio-validation-") as temporary:
+    with tempfile.TemporaryDirectory(prefix="sll-audio-validation-") as temporary:
         report_path = Path(temporary) / "audio.json"
         subprocess.run([str(application), "--check-announcement-audio", str(report_path)],
                        timeout=105, check=True, creationflags=subprocess.CREATE_NO_WINDOW)
         report = json.loads(report_path.read_text(encoding="utf-8"))
+        buffers = report.get("complete_pcm_buffers", [])
         if (report.get("voice_playback_calls") != 3 or report.get("received_records") != 2
-                or report.get("reused_worker") is not True):
+                or report.get("reused_worker") is not True or report.get("device_completions") != 3
+                or len(buffers) != 3 or not all(buffer.get("tail_marker_consumed") is True
+                    and buffer.get("completion_after_duration") is True for buffer in buffers)):
             raise SystemExit("Packaged preview, received announcement and weather speech did not pass")
         print("Verified packaged preview, received announcement and weather alert through durable inbox, presenter, "
-              "audio queue and one warm Piper process; non-silent PCM with Windows playback intercepted.")
+              "audio queue and one warm Piper process; complete PCM tails and delayed device completion simulated silently.")
     headless = "--headless" in sys.argv
     if not headless:
         subprocess.run([str(application), "--check-presentation"], timeout=15,
                        creationflags=subprocess.CREATE_NO_WINDOW, check=True)
-    installer = verify(ROOT / "build" / "installer-payload" / "SLS_Mass_Notify_Installer", "sls_installer")
+    installer = verify(ROOT / "build" / "installer-payload" / "SLL_Mass_Notify_Installer", "sll_installer")
     for directory in (application.parent, installer.parent):
         for relative in ("_internal/_tcl_data/init.tcl", "_internal/_tk_data/tk.tcl"):
             if not (directory / relative).is_file():
                 raise SystemExit(f"Missing packaged UI runtime scripts: {directory / relative}")
-    embedded = installer.parent / "_internal" / "SLS_Mass_Notify" / "SLS_Mass_Notify.exe"
+    embedded = installer.parent / "_internal" / "SLL_Mass_Notify" / "SLL_Mass_Notify.exe"
     if digest(embedded) != digest(application):
         raise SystemExit("Installer contains a different application payload")
     # This check withdraws the setup window before constructing any widgets.
@@ -153,10 +164,10 @@ def main():
     ui_environment.pop("TK_LIBRARY", None)
     subprocess.run([str(installer), "--check-ui"], timeout=45, env=ui_environment,
                    creationflags=subprocess.CREATE_NO_WINDOW, check=True)
-    bootstrap = distribution / "SLS_Mass_Notify_Installer.exe"
+    bootstrap = distribution / "SLL_Mass_Notify_Installer.exe"
     report = subprocess.run([str(bootstrap), "--check-package"], capture_output=True, text=True,
                             timeout=30, creationflags=subprocess.CREATE_NO_WINDOW, check=True)
-    expected_report = f"SLS_PACKAGE_OK {VERSION} {digest(ROOT / 'build' / 'setup-payload.zip')} {source_digest()}"
+    expected_report = f"SLL_PACKAGE_OK {VERSION} {digest(ROOT / 'build' / 'setup-payload.zip')} {source_digest()}"
     if report.stdout.strip() != expected_report:
         raise SystemExit(f"Bootstrap embedded package verification failed: {report.stdout!r}")
     print(f"Verified app and self-contained installer: version {VERSION}, Python 3.14.9, {ssl.OPENSSL_VERSION}; inventories, source bytecode, identical app payload, and bootstrap package self-check.")

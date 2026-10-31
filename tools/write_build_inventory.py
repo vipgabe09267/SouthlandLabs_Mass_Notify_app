@@ -9,7 +9,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
-from sls_version import VERSION
+from sll_version import VERSION
 
 
 def main():

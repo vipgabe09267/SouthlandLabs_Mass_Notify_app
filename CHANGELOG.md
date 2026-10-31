@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.0.14-beta - 2026-10-30
+
+- Wait for Windows audio-device completion before marking speech finished or removing its WAV file, preventing the final words from being cut off by a duration timer. Keep speech output separate from chime previews, while retaining Dismiss, expiry, shutdown, and urgent-alert interruption.
+- Rebrand the desktop client and installer as Southland Labs Mass Notify, using the project website's logo, icon, and color palette. Update application metadata, repository documentation, and distribution names.
+- Make the text insertion cursor visible in editable fields and retain readable focus and selection colors in the new theme.
+- Keep the Settings header and setup controls within the available screen at 100–200% scaling. Improve text contrast when a colored notification's image cannot load.
+- Upgrade existing installations in place, replace only owned old shortcuts and executables, and retain settings, saved credentials, History, downloaded voices, and installation preferences. Recover shortcut and uninstall-registration changes after an interrupted upgrade as well as application files.
+- Continue bounded cleanup of cached installers saved before the rebrand. Earlier clients need a one-time manual upgrade because the repository and installer filenames have changed.
+- Preserve existing PBX protocol names and authenticated desktop contracts during the rebrand.
+
 ## 1.0.13-beta - 2026-10-25
 
 - Restore always-on-top display for regular announcements as well as urgent alerts. Show the priority as `URGENT` or `Regular` on plain and image-backed notifications, retaining a separate test marker and existing dismissal/expiry rules. Verify native Windows z-order against a normal application raised afterward.
@@ -70,7 +80,7 @@ Changes since 1.0.8-beta:
 
 - Fixed successive announcements failing to arrive when live streaming stalls. Added polling fallback and automatic receipt retries.
 - Skipped announcements missed while asleep or disconnected. Queued and visible announcements now expire within ten minutes of publication.
-- Fixed blank colored announcements and duplicate plain text. Kept Dismiss visible, resized images to fit, and restored the SLS window icon.
+- Fixed blank colored announcements and duplicate plain text. Kept Dismiss visible, resized images to fit, and restored the application window icon.
 - Fixed Settings and installer windows extending below the taskbar, including at larger text sizes.
 - Replaced setup with one self-contained installer EXE. Fixed ownership and Start Menu permission errors, unresponsive installation, and upgrades blocked by lingering app processes.
 - Added local history, connection health, diagnostic export, and separate connection-test and local-preview controls.

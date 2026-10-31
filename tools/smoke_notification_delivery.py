@@ -9,11 +9,11 @@ from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
-import sls_mass_notify as client
+import sll_mass_notify as client
 
 
 def main():
-    with tempfile.TemporaryDirectory(prefix="sls-delivery-") as directory:
+    with tempfile.TemporaryDirectory(prefix="sll-delivery-") as directory:
         root = tk.Tk()
         root.withdraw()
         real_toplevel = tk.Toplevel

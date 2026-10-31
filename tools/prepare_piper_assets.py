@@ -10,8 +10,8 @@ import sys
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
-from sls_voices import DEFAULT_VOICE, read_catalog
-from sls_install_safety import remove_staging, reject_reparse
+from sll_voices import DEFAULT_VOICE, read_catalog
+from sll_install_safety import remove_staging, reject_reparse
 
 
 def matches(path, entry):

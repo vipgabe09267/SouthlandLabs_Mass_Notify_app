@@ -8,8 +8,8 @@ import json
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
-from sls_audio import inspect_wav
-from sls_speech import DEFAULT_VOICE
+from sll_audio import inspect_wav
+from sll_speech import DEFAULT_VOICE
 
 SAMPLES = {
     "fr_FR": "Ceci est une annonce de test. Veuillez lire les instructions.",
@@ -20,8 +20,8 @@ SAMPLES = {
 
 
 def check(application=None):
-    command = [str(application)] if application else [sys.executable, str(ROOT / "src" / "sls_mass_notify.py")]
-    with tempfile.TemporaryDirectory(prefix="sls-speech-check-") as directory:
+    command = [str(application)] if application else [sys.executable, str(ROOT / "src" / "sll_mass_notify.py")]
+    with tempfile.TemporaryDirectory(prefix="sll-speech-check-") as directory:
         request, output = Path(directory) / "request.json", Path(directory) / "speech.wav"
         for voice in (DEFAULT_VOICE,):
             request.write_text(json.dumps({"voice": voice, "text": SAMPLES.get(
