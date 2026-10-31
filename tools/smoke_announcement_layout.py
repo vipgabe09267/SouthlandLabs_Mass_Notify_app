@@ -11,10 +11,10 @@ from PIL import Image, ImageDraw
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
-import sls_presentation as presentation
-from sls_mass_notify import SettingsWindow
-from sls_presentation_probe import check_presentation
-from sls_windowing import fit_window, monitor_work_area
+import sll_presentation as presentation
+from sll_mass_notify import SettingsWindow
+from sll_presentation_probe import check_presentation
+from sll_windowing import fit_window, monitor_work_area
 from smoke_window_layout import check_control
 
 

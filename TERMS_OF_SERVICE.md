@@ -1,4 +1,4 @@
-# SouthlandServers Mass Notification App Terms of Service
+# Southland Labs Mass Notify Terms of Service
 
 By installing or using this app, you acknowledge that it is a desktop notification client that receives alert and announcement content from user-configured PBX connections using authenticated live streams.
 

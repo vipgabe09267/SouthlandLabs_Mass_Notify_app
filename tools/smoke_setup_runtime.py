@@ -13,14 +13,15 @@ import sys
 import tempfile
 import time
 import json
+import traceback
 import tkinter as tk
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
-import sls_installer as installer
-import sls_install_safety as safety
-import sls_install_windows as windows
+import sll_installer as installer
+import sll_install_safety as safety
+import sll_install_windows as windows
 
 
 FIXTURE = r'''
@@ -55,8 +56,14 @@ def main():
         installer.create_protected_directories(existing, allow_shell_delete=True)
     print("PASS: real shared Start Menu directory permissions (read-only).", flush=True)
     compiler = windows.system_directory().parent / "Microsoft.NET/Framework64/v4.0.30319/csc.exe"
-    with tempfile.TemporaryDirectory(prefix="sls-setup-smoke-") as directory:
-        base = Path(directory)
+    fixture_parent = ROOT / "build"
+    fixture_parent.mkdir(exist_ok=True)
+    # Keep native fixture paths inside the workspace. A sandbox can permit the
+    # short %TEMP% alias while denying expansion of its user-profile ancestor,
+    # making the same executable appear to have two different image paths.
+    with tempfile.TemporaryDirectory(prefix="sll-setup-smoke-", dir=fixture_parent) as directory:
+        base = Path(directory).resolve()
+        assert base.is_relative_to(fixture_parent.resolve())
         target, other = base / "installed", base / "unrelated"
         target.mkdir()
         other.mkdir()
@@ -65,7 +72,7 @@ def main():
         executable = target / installer.EXE_NAME
         subprocess.run([str(compiler), "/nologo", "/target:winexe", "/platform:x64",
                         "/out:" + str(executable), str(source)], check=True, creationflags=subprocess.CREATE_NO_WINDOW)
-        replacement = ((ROOT / "dist" / "SLS_Mass_Notify" / installer.EXE_NAME).read_bytes()
+        replacement = ((ROOT / "dist" / "SLL_Mass_Notify" / installer.EXE_NAME).read_bytes()
                        if full_payload else executable.read_bytes() + b"replacement-build")
         other_exe = other / installer.EXE_NAME
         shutil.copy2(executable, other_exe)
@@ -93,11 +100,12 @@ def main():
                     (path / installer.EXE_NAME).write_bytes(replacement)
                     (path / "new-runtime.txt").write_text("new", encoding="utf-8")
 
+
             with ExitStack() as patches:
                 if full_payload:
-                    package = ROOT / "build" / "installer-payload" / "SLS_Mass_Notify_Installer"
+                    package = ROOT / "build" / "installer-payload" / "SLL_Mass_Notify_Installer"
                     patches.enter_context(mock.patch.object(installer.sys, "frozen", True, create=True))
-                    patches.enter_context(mock.patch.object(installer.sys, "executable", str(package / "SLS_Mass_Notify_Installer.exe")))
+                    patches.enter_context(mock.patch.object(installer.sys, "executable", str(package / "SLL_Mass_Notify_Installer.exe")))
                     patches.enter_context(mock.patch.object(installer.sys, "_MEIPASS", str(package / "_internal"), create=True))
                 for name in ("require_admin", "verify_protected_directory", "protect_new_directory", "write_uninstall_registry", "restore_uninstall_registry"):
                     patches.enter_context(mock.patch.object(installer, name))
@@ -112,6 +120,19 @@ def main():
                 root = tk.Tk()
                 root.withdraw()
                 window = installer.InstallerWindow(root)
+                finished = window.operation.finished
+                def report_finished(result, error):
+                    if error is not None:
+                        # Preserve the original failure when rollback itself
+                        # fails; the message box shows only the last exception.
+                        traceback.print_exception(error, chain=True)
+                    return finished(result, error)
+                window.operation.finished = report_finished
+                report_progress = window.operation.progress
+                def report_step(message):
+                    print("SETUP: " + message, flush=True)
+                    report_progress(message)
+                window.operation.progress = report_step
                 window.accept_terms.set(True)
                 window.launch.set(False)
                 window.startup.set(False)
@@ -144,7 +165,7 @@ def main():
                 uninstall_link = windows.shortcut_identity(shortcuts["uninstall"])
                 assert uninstall_link["arguments"] == "--uninstall"
                 if full_payload:
-                    expected_uninstaller = target / installer.MAINTENANCE_DIR / "SLS_Mass_Notify_Installer.exe"
+                    expected_uninstaller = target / installer.MAINTENANCE_DIR / "SLL_Mass_Notify_Installer.exe"
                     assert windows.normalized_image_path(uninstall_link["target"]) == windows.normalized_image_path(expected_uninstaller)
                     assert expected_uninstaller.is_file(), "Uninstall shortcut points to a missing runtime"
                 assert not shortcuts["startup"].exists()
@@ -168,8 +189,8 @@ def main():
 
 def check_file_upgrade():
     """Exercise the complete large payload in a fixture, with no UI or OS writes."""
-    package = ROOT / "build" / "installer-payload" / "SLS_Mass_Notify_Installer"
-    with tempfile.TemporaryDirectory(prefix="sls-file-upgrade-", dir=ROOT / "build") as directory:
+    package = ROOT / "build" / "installer-payload" / "SLL_Mass_Notify_Installer"
+    with tempfile.TemporaryDirectory(prefix="sll-file-upgrade-", dir=ROOT / "build") as directory:
         base = Path(directory).resolve()
         assert base.is_relative_to((ROOT / "build").resolve())
         target = base / "installed"
@@ -182,7 +203,7 @@ def check_file_upgrade():
             return result
         with ExitStack() as patches:
             patches.enter_context(mock.patch.object(installer.sys, "frozen", True, create=True))
-            patches.enter_context(mock.patch.object(installer.sys, "executable", str(package / "SLS_Mass_Notify_Installer.exe")))
+            patches.enter_context(mock.patch.object(installer.sys, "executable", str(package / "SLL_Mass_Notify_Installer.exe")))
             patches.enter_context(mock.patch.object(installer.sys, "_MEIPASS", str(package / "_internal"), create=True))
             installer.stage_payload(target)
             with (target / installer.EXE_NAME).open("ab") as output:

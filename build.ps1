@@ -51,11 +51,11 @@ if (-not $Headless) {
     Invoke-NativeChecked -Executable $buildPython -Arguments @('tools/smoke_announcement_layout.py')
 } else { Write-Warning 'Headless development build: desktop UI smoke checks were skipped.' }
 Invoke-NativeChecked -Executable $buildPython -Arguments @('tools/write_version_info.py')
-Invoke-NativeChecked -Executable $buildPython -Arguments @('-m', 'PyInstaller', '--noconfirm', '--clean', '--onedir', '--windowed', '--noupx', '--name', 'SLS_Mass_Notify', '--icon', 'assets/favicon.ico', '--version-file', 'build/version_info_app.txt', '--add-data', 'assets/icon.png;.', '--add-data', 'assets/favicon.ico;.', '--add-data', 'assets/audio;audio', '--add-data', 'build/tts;tts', '--collect-all', 'piper', '--copy-metadata', 'piper-tts', '--copy-metadata', 'onnxruntime', '--copy-metadata', 'numpy', '--copy-metadata', 'protobuf', '--copy-metadata', 'flatbuffers', '--copy-metadata', 'pathvalidate', 'src/sls_mass_notify.py')
-$AppExe = Join-Path $ProjectRoot 'dist\SLS_Mass_Notify\SLS_Mass_Notify.exe'
+Invoke-NativeChecked -Executable $buildPython -Arguments @('-m', 'PyInstaller', '--noconfirm', '--clean', '--onedir', '--windowed', '--noupx', '--name', 'SLL_Mass_Notify', '--icon', 'assets/favicon.ico', '--version-file', 'build/version_info_app.txt', '--add-data', 'assets/icon.png;.', '--add-data', 'assets/favicon.ico;.', '--add-data', 'assets/audio;audio', '--add-data', 'build/tts;tts', '--collect-all', 'piper', '--copy-metadata', 'piper-tts', '--copy-metadata', 'onnxruntime', '--copy-metadata', 'numpy', '--copy-metadata', 'protobuf', '--copy-metadata', 'flatbuffers', '--copy-metadata', 'pathvalidate', 'src/sll_mass_notify.py')
+$AppExe = Join-Path $ProjectRoot 'dist\SLL_Mass_Notify\SLL_Mass_Notify.exe'
 if (-not (Test-Path -LiteralPath $AppExe -PathType Leaf)) { throw 'Application output was not created.' }
 if ($Release) {
     Sign-ReleaseExecutable -Path $AppExe -SignTool $SignTool -CertificateThumbprint $CertificateThumbprint -TrustedSignerSha256 $TrustedSignerSha256 -TimestampUrl $TimestampUrl
 }
-Invoke-NativeChecked -Executable $buildPython -Arguments @('tools/write_build_inventory.py', 'dist/SLS_Mass_Notify')
+Invoke-NativeChecked -Executable $buildPython -Arguments @('tools/write_build_inventory.py', 'dist/SLL_Mass_Notify')
 Write-Host "Built onedir application: $AppExe"

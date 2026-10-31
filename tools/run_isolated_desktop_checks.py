@@ -96,8 +96,8 @@ def main():
     parser.add_argument("--application", type=Path, help="Also check the packaged app on the private desktop")
     arguments = parser.parse_args()
     application = arguments.application.resolve(strict=True) if arguments.application else None
-    if application is not None and (not application.is_file() or application.name != "SLS_Mass_Notify.exe"):
-        raise SystemExit("Application must be the packaged SLS_Mass_Notify.exe")
+    if application is not None and (not application.is_file() or application.name != "SLL_Mass_Notify.exe"):
+        raise SystemExit("Application must be the packaged SLL_Mass_Notify.exe")
     if os.name != "nt":
         raise SystemExit("Private desktop validation requires Windows.")
     kernel = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -120,7 +120,7 @@ def main():
     )
     for function, args, result in signatures:
         function.argtypes, function.restype = args, result
-    desktop_name = "SLSAudit_" + uuid.uuid4().hex
+    desktop_name = "SLLAudit_" + uuid.uuid4().hex
     desktop = user.CreateDesktopW(desktop_name, None, None, 0, 0x10000000, None)
     if not desktop:
         raise ctypes.WinError(ctypes.get_last_error())

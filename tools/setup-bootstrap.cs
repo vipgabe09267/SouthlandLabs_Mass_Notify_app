@@ -15,7 +15,7 @@ using System.Windows.Forms;
 
 static class SetupBootstrap
 {
-    const string SetupName = "SLS_Mass_Notify_Installer.exe";
+    const string SetupName = "SLL_Mass_Notify_Installer.exe";
     static readonly HashSet<string> Writers = new HashSet<string> {
         "S-1-5-18", "S-1-5-32-544",
         "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464"
@@ -149,7 +149,7 @@ static class SetupBootstrap
             // Build verification is deliberately non-elevating and never installs.
             if (args.Length == 1 && args[0] == "--check-package") {
                 using (Stream payload = Payload()) Unpack(payload, null);
-                Console.WriteLine("SLS_PACKAGE_OK " + BuildInfo.Version + " " + BuildInfo.PayloadSha256 + " " + BuildInfo.SourceSha256);
+                Console.WriteLine("SLL_PACKAGE_OK " + BuildInfo.Version + " " + BuildInfo.PayloadSha256 + " " + BuildInfo.SourceSha256);
                 return 0;
             }
             if (!Elevated()) {
@@ -167,9 +167,9 @@ static class SetupBootstrap
             }
             string programFiles = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles);
             ProtectedDirectory(programFiles);
-            string parent = Path.Combine(programFiles, "Southland Servers Group");
+            string parent = Path.Combine(programFiles, "Southland Labs");
             CreateProtected(parent);
-            string stage = Path.Combine(parent, ".sls-setup-" + Guid.NewGuid().ToString("N"));
+            string stage = Path.Combine(parent, ".sll-setup-" + Guid.NewGuid().ToString("N"));
             CreateProtected(stage);
             try {
                 using (Stream payload = Payload()) Unpack(payload, stage);
@@ -186,18 +186,18 @@ static class SetupBootstrap
                 try { Cleanup(stage); }
                 catch (Exception cleanup) {
                     if (!quiet) MessageBox.Show("Setup staging files could not be removed:\n" + stage + "\n\n" + cleanup.Message,
-                                                "SLS Mass Notify Setup", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                                                "Southland Labs Mass Notify Setup", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 }
             }
         }
         catch (Win32Exception error) {
             if (error.NativeErrorCode == 1223) return 740; // UAC cancelled.
-            if (!quiet) MessageBox.Show(error.Message, "SLS Mass Notify Setup", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            if (!quiet) MessageBox.Show(error.Message, "Southland Labs Mass Notify Setup", MessageBoxButtons.OK, MessageBoxIcon.Error);
             return 1603;
         }
         catch (Exception error) {
             if (quiet) Console.Error.WriteLine(error.Message);
-            if (!quiet) MessageBox.Show(error.Message, "SLS Mass Notify Setup", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            if (!quiet) MessageBox.Show(error.Message, "Southland Labs Mass Notify Setup", MessageBoxButtons.OK, MessageBoxIcon.Error);
             return 1603;
         }
     }

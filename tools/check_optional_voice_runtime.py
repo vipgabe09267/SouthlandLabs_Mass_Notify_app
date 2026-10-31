@@ -9,16 +9,17 @@ import threading
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
-from sls_audio import inspect_wav
-from sls_voices import VoiceStore, read_catalog
+from sll_audio import inspect_wav
+from sll_voices import VoiceStore, read_catalog
 
 
 def check(application):
     voice = "en_US-amy-low"
     bundled = application.parent / "_internal" / "tts"
-    with tempfile.TemporaryDirectory(prefix="sls-optional-voice-", dir=ROOT / "build") as temporary:
+    with tempfile.TemporaryDirectory(prefix="sll-optional-voice-", dir=ROOT / "build") as temporary:
         base = Path(temporary)
-        cache = base / "SouthlandServers/SLS_Mass_Notify/voices"
+        from sll_legacy import APP_SHORT_NAME, COMPANY_NAME
+        cache = base / COMPANY_NAME / APP_SHORT_NAME / "voices"
         store = VoiceStore(bundled=bundled, cache=cache, catalog=read_catalog(bundled / "voices.json"))
         assert store.location(voice) is None, "Optional voice was unexpectedly bundled"
         print("Checking explicit optional Amy download from the pinned HTTPS source...", flush=True)

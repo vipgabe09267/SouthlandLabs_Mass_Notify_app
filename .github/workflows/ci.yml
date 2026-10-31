@@ -25,7 +25,7 @@ jobs:
         with:
           name: UNSIGNED-development-package
           path: |
-            dist/packages/SLS_Mass_Notify_Installer.zip
-            dist/packages/SLS_Mass_Notify_Installer.zip.sha256
+            dist/packages/SLL_Mass_Notify_Installer.zip
+            dist/packages/SLL_Mass_Notify_Installer.zip.sha256
           retention-days: 7
           if-no-files-found: error
